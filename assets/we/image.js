@@ -56,8 +56,11 @@
       this.mvpPassInverse = M.identity();
       this.mvpCopy = M.identity();
       this.mvpCopyInverse = M.identity();
-      this.modelMatrix = M.identity();
-      this.viewProjectionMatrix = M.identity();
+      this.rotModel = M.identity();
+      this.copyModel = M.identity();
+      this.posZ = 0;
+      this.castShadow = json.castshadow === true;
+      this.casterPass = null;
       this.sceneSpace = new Float32Array(18);
       this.copySpace = new Float32Array(18);
       this.texcoordCopy = new Float32Array(12);
@@ -195,7 +198,6 @@
       gl.bufferData(gl.ARRAY_BUFFER, PASS_SPACE_POSITION, gl.STATIC_DRAW);
       gl.bindBuffer(gl.ARRAY_BUFFER, this.buffers.texcoordPass);
       gl.bufferData(gl.ARRAY_BUFFER, TEXCOORD_PASS, gl.STATIC_DRAW);
-      this.viewProjectionMatrix = M.identity();
       this.mvpPass = M.identity();
       this.mvpPassInverse = M.identity();
       this.updateGeometryBuffers();
@@ -205,7 +207,42 @@
       this.visible.listen(markDirty);
       for (const effect of this.effects) effect.visible.listen(markDirty);
       this.colorBlendMode.listen(() => { this.rebuildBlendPass(); });
+      if (this.castShadow && this.scene.lights.shadowed) this.casterPass = await this.buildCasterPass();
       this.initialized = true;
+    }
+
+    // The depth only pass the shadow atlas draws this layer with, cut out by its alpha
+    async buildCasterPass() {
+      const Mat = G.WEMaterial;
+      const first = this.material.passes[0];
+      const combos = { ALPHATOCOVERAGE: 1 };
+      for (const key of ['SKINNING', 'BONECOUNT']) if (first.combos[key] !== undefined) combos[key] = first.combos[key];
+      const data = {
+        blending: Mat.BLENDING.NORMAL, cullmode: Mat.CULL.DISABLE, depthtest: Mat.DEPTHTEST.ENABLED, depthwrite: Mat.DEPTHWRITE.ENABLED,
+        shader: 'shadowcaster', textures: {}, usertextures: {}, textureUsers: {}, combos, constants: {},
+      };
+      const pass = new G.WEPass.Pass(this, new G.WEFBO.Provider(this.scene.gl, this.fboProvider), data, null, null, null);
+      pass.depthOnly = true;
+      await pass.build();
+      if (this.firstPassGeometry) pass.setGeometryCallback(this.firstPassGeometry.setup, this.firstPassGeometry.draw, this.firstPassGeometry.cleanup);
+      return pass;
+    }
+
+    castsShadow() { return this.initialized && !this.rebuilding && this.castShadow && this.casterPass !== null && this.shown(); }
+
+    renderShadow(face) {
+      const pass = this.casterPass;
+      const mvp = M.multiply(face.viewProjection, this.rotModel);
+      pass.viewportRect = face.viewport;
+      pass.setDestination(this.scene.lights.atlas);
+      pass.setInput(this.texture);
+      pass.setPosition(this.buffers.sceneSpace);
+      pass.setTexCoord(this.buffers.texcoordCopy);
+      pass.setModelMatrix(this.rotModel);
+      pass.setViewProjectionMatrix(face.viewProjection);
+      pass.setModelViewProjectionMatrix(mvp);
+      pass.setModelViewProjectionMatrixInverse(M.inverse(mvp));
+      pass.render();
     }
 
     // CImage constructor: _rt_imageLayerComposite_<id>_a / _b, registered on the scene so
@@ -213,8 +250,9 @@
     createCompositeFramebuffers() {
       const size = this.size;
       const flags = this.texture.flags;
-      this.mainFBO = this.scene.fbos.create('_rt_imageLayerComposite_' + this.id + '_a', 'rgba8888', flags, size, size);
-      this.subFBO = this.scene.fbos.create('_rt_imageLayerComposite_' + this.id + '_b', 'rgba8888', flags, size, size);
+      const format = this.scene.colorFormat;
+      this.mainFBO = this.scene.fbos.create('_rt_imageLayerComposite_' + this.id + '_a', format, flags, size, size);
+      this.subFBO = this.scene.fbos.create('_rt_imageLayerComposite_' + this.id + '_b', format, flags, size, size);
       this.currentMainFBO = this.mainFBO;
       this.currentSubFBO = this.subFBO;
       this.fboSize = [size[0], size[1]];
@@ -236,6 +274,7 @@
         for (const fbo of entry.effect.fbos) provider.createFromDefinition(fbo, this.texture.flags, this.size);
         const passes = [];
         let overrideIndex = 0;
+        let previousTarget = null;
         for (let i = 0; i < entry.effect.passes.length; i++) {
           const effectPass = entry.effect.passes[i];
           const where = entry.effect.filename + ' pass ' + i;
@@ -246,17 +285,19 @@
             if (effectPass.command !== Mat.COMMAND.COPY) throw new Error(where + ': only the copy command is supported for a pass without material');
             const virtualPass = COPY_MATERIAL_PASS();
             virtualPass.textures[0] = effectPass.source;
-            const p = new G.WEPass.Pass(this, provider, virtualPass, null, null, effectPass.target);
+            const p = new G.WEPass.Pass(this, provider, virtualPass, null, null, effectPass.target, previousTarget);
             await p.build();
             passes.push(p);
+            previousTarget = effectPass.target;
             continue;
           }
           const override = overrideIndex < entry.passOverrides.length ? entry.passOverrides[overrideIndex] : null;
           for (const pass of effectPass.material.passes) {
-            const p = new G.WEPass.Pass(this, provider, pass, override, effectPass.binds, effectPass.target);
+            const p = new G.WEPass.Pass(this, provider, pass, override, effectPass.binds, effectPass.target, previousTarget);
             await p.build();
             passes.push(p);
           }
+          previousTarget = effectPass.target;
           if (overrideIndex < entry.passOverrides.length) overrideIndex++;
         }
         this.effectPasses.push({ entry, provider, passes });
@@ -297,6 +338,7 @@
         this.subFBO.dispose();
         this.createCompositeFramebuffers();
         await this.buildPasses();
+        if (this.castShadow && this.scene.lights.shadowed) this.casterPass = await this.buildCasterPass();
       })().then(() => { if (this.rebuilding === pending) this.rebuilding = null; });
       this.rebuilding = pending;
       pending.catch((e) => this.scene.fail(e));
@@ -304,6 +346,7 @@
     }
 
     disposePasses() {
+      if (this.casterPass) { this.casterPass.dispose(); this.casterPass = null; }
       for (const p of this.materialPasses) p.dispose();
       for (const e of this.effectPasses) { for (const p of e.passes) p.dispose(); e.provider.dispose(); }
       if (this.blendPass) this.blendPass.dispose();
@@ -354,8 +397,6 @@
           pass.setBlendingMode(G.WEMaterial.BLENDING.TRANSLUCENT);
           pass.setGeometryCallback(this.firstPassGeometry.setup, this.firstPassGeometry.draw, this.firstPassGeometry.cleanup);
         }
-        pass.setModelMatrix(this.modelMatrix);
-        pass.setViewProjectionMatrix(this.viewProjectionMatrix);
         const target = this.configurePassTarget(pass, asInput, inTargetEffectSequence, effectInput);
         const writesToTarget = target !== null;
         if (writesToTarget) {
@@ -364,11 +405,16 @@
           effectInput = target.effectInput;
         }
         if (!writesToTarget && i === passes.length - 1 && this.visible.getBool()) {
-          spacePosition = this.buffers.sceneSpace;
+          spacePosition = this.screenQuad ? this.buffers.passSpace : this.buffers.sceneSpace;
           drawTo = this.scene.fbo;
           projection = this.mvpScreen;
           inverseProjection = this.mvpScreenInverse;
         }
+        // World positions for lighting come from the model matrix of the space a pass draws in,
+        // and the view projection is whatever carries that model to the pass projection
+        const model = spacePosition === this.buffers.sceneSpace ? this.rotModel : (spacePosition === this.buffers.passSpace ? this.passModel : this.copyModel);
+        pass.setModelMatrix(model);
+        pass.setViewProjectionMatrix(M.multiply(projection, M.inverse(model)));
         pass.setDestination(drawTo);
         pass.setInput(asInput);
         pass.setPreviousInput(inTargetEffectSequence ? effectInput : null);
@@ -429,6 +475,19 @@
     updateScenePosition(origin, size, scale, sceneWidth, sceneHeight) {
       const sx = size[0] * scale[0], sy = size[1] * scale[1];
       const pos = this.pos;
+      if (this.scene.is3D) {
+        // World units, y up, the quad centred on its origin at the origin's depth
+        pos[0] = origin[0] - sx / 2;
+        pos[2] = origin[0] + sx / 2;
+        pos[1] = origin[1] + sy / 2;
+        pos[3] = origin[1] - sy / 2;
+        if (this.alignment.indexOf('top') >= 0) { pos[1] -= sy / 2; pos[3] -= sy / 2; }
+        else if (this.alignment.indexOf('bottom') >= 0) { pos[1] += sy / 2; pos[3] += sy / 2; }
+        if (this.alignment.indexOf('left') >= 0) { pos[0] += sx / 2; pos[2] += sx / 2; }
+        else if (this.alignment.indexOf('right') >= 0) { pos[0] -= sx / 2; pos[2] -= sx / 2; }
+        this.posZ = origin[2];
+        return;
+      }
       pos[0] = origin[0] - sx / 2;
       pos[3] = origin[1] + sy / 2;
       pos[2] = origin[0] + sx / 2;
@@ -441,12 +500,13 @@
       pos[1] = sceneHeight / 2 - pos[1];
       pos[2] -= sceneWidth / 2;
       pos[3] = sceneHeight / 2 - pos[3];
+      this.posZ = 0;
     }
 
     uploadGeometryBuffers(size) {
       const gl = this.scene.gl;
-      const pos = this.pos;
-      this.sceneSpace.set([pos[0], pos[1], 0, pos[0], pos[3], 0, pos[2], pos[1], 0, pos[2], pos[1], 0, pos[0], pos[3], 0, pos[2], pos[3], 0]);
+      const pos = this.pos, z = this.posZ;
+      this.sceneSpace.set([pos[0], pos[1], z, pos[0], pos[3], z, pos[2], pos[1], z, pos[2], pos[1], z, pos[0], pos[3], z, pos[2], pos[3], z]);
       let width = 1, height = 1;
       const tex = this.texture;
       if (tex && !tex.animated && (tex.textureWidth(0) !== tex.realWidth || tex.textureHeight(0) !== tex.realHeight)) {
@@ -468,14 +528,13 @@
       gl.bufferData(gl.ARRAY_BUFFER, this.copySpace, gl.DYNAMIC_DRAW);
       gl.bindBuffer(gl.ARRAY_BUFFER, this.buffers.texcoordCopy);
       gl.bufferData(gl.ARRAY_BUFFER, this.texcoordCopy, gl.DYNAMIC_DRAW);
-      this.sceneCenter = [(pos[0] + pos[2]) / 2, (pos[1] + pos[3]) / 2, 0];
+      this.sceneCenter = [(pos[0] + pos[2]) / 2, (pos[1] + pos[3]) / 2, z];
       if (this.model.passthrough) {
         this.mvpCopy.set(this.mvpScreen);
       } else {
         this.mvpCopy.set(M.ortho(0, size[0], 0, size[1], -1, 1));
       }
       this.mvpCopyInverse.set(M.inverse(this.mvpCopy));
-      this.modelMatrix.set(M.ortho(0, size[0], 0, size[1], -1, 1));
     }
 
     // CImage::updateGeometryBuffers
@@ -483,7 +542,15 @@
       const sceneWidth = this.scene.width, sceneHeight = this.scene.height;
       const transform = this.resolveTransform();
       const origin = transform.origin.slice();
-      const size = this.resolveGeometrySize(sceneWidth, sceneHeight, origin);
+      let size = this.resolveGeometrySize(sceneWidth, sceneHeight, origin);
+      if (this.puppet) {
+        // The buffers cover the whole mesh, which may reach past the layer's own rectangle
+        const box = this.puppet.geometry.layerBox(size);
+        const shift = G.WEObjects.rotateVec2(box.center[0] * transform.scale[0], box.center[1] * transform.scale[1], transform.angle);
+        origin[0] += shift[0];
+        origin[1] += shift[1];
+        size = box.size;
+      }
       const previous = this.size;
       this.size = size;
       if (this.mainFBO && (size[0] !== this.fboSize[0] || size[1] !== this.fboSize[1]) && !this.rebuilding) this.resizeFramebuffers();
@@ -502,14 +569,22 @@
       if (angles[0] !== 0 || angles[1] !== 0 || angles[2] !== 0) {
         const c = this.sceneCenter;
         rotModel = M.translate(rotModel, c[0], c[1], c[2]);
-        if (angles[2] !== 0) rotModel = M.rotate(rotModel, -angles[2], 0, 0, 1);
-        if (angles[1] !== 0) rotModel = M.rotate(rotModel, angles[1], 0, 1, 0);
-        if (angles[0] !== 0) rotModel = M.rotate(rotModel, -angles[0], 1, 0, 0);
+        rotModel = M.multiply(rotModel, this.rotationMatrix(angles));
         rotModel = M.translate(rotModel, -c[0], -c[1], -c[2]);
       }
+      this.rotModel = rotModel;
+      this.copyModel = M.multiply(rotModel, M.translation(this.pos[0], this.pos[3], this.posZ));
       const camera = this.scene.camera;
+      this.screenQuad = this.scene.is3D && this.model.fullscreen;
+      if (this.screenQuad) {
+        this.passModel = M.identity();
+        this.mvpScreen.set(M.identity());
+        this.mvpScreenInverse.set(M.identity());
+        return;
+      }
+      this.passModel = M.inverse(this.mvpPass);
       let mvp = M.multiply(this.perspective ? camera.perspectiveViewProjection : camera.viewProjection, rotModel);
-      if (this.scene.parallax.enabled.getBool()) {
+      if (!this.scene.is3D && this.scene.parallax.enabled.getBool()) {
         const amount = this.scene.parallax.amount.getNumber();
         const depth = this.parallaxDepth.getVec(2);
         const displacement = this.scene.parallaxDisplacement;
@@ -529,7 +604,7 @@
     // CImage::render
     render() {
       if (!this.initialized || this.rebuilding) return;
-      if (!this.visible.getBool()) return;
+      if (!this.shown()) return;
       const gl = this.scene.gl;
       gl.colorMask(true, true, true, true);
       this.updateScreenSpacePosition();
@@ -545,6 +620,8 @@
     }
 
     setPaused(paused) { if (this.texture) this.texture.setPaused(paused); }
+
+    isSolid() { return this.json.solid === true; }
 
     // CRenderable / CImage accessors the passes read
     getBrightness() { return this.brightness.getNumber(); }

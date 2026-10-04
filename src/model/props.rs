@@ -383,6 +383,18 @@ pub fn join_folder(folder: &str, file: &str) -> String {
     }
 }
 
+/// Name of the fit control: media wallpapers' libmpv scaling, scenes' projection mapping.
+pub const FIT_CONTROL: &str = "scaler";
+
+/// The fit control of a Wallpaper Engine scene, starting as Wallpaper Engine draws scenes:
+/// covering the display.
+pub fn scene_fit_control() -> Value {
+    serde_json::json!({
+        "type": "scalerDropdown", "text": "Choose a fit", "help": "Wallpaper scaling", "value": 3,
+        "items": ["None", "Fill", "Uniform", "Uniform Fill"]
+    })
+}
+
 /// Built-in controls for media wallpapers (libmpv properties), matching Lively's mpv defaults.
 pub const MEDIA_DEFAULTS: &str = r##"{
   "saturation": { "type": "slider", "text": "Saturation", "value": 0, "min": -100, "max": 100, "step": 1 },

@@ -370,9 +370,10 @@
     if (aniso) gl.texParameterf(gl.TEXTURE_2D, aniso.TEXTURE_MAX_ANISOTROPY_EXT, Math.min(8, gl.getParameter(aniso.MAX_TEXTURE_MAX_ANISOTROPY_EXT)));
   }
 
+  // Decoded image files arrive top-down, their first row landing at v = 0 like raw payloads
   function decodeImageBlob(data, mime) {
     const blob = new Blob([data], { type: mime });
-    return createImageBitmap(blob, { premultiplyAlpha: 'none', colorSpaceConversion: 'none' });
+    return createImageBitmap(blob, { premultiplyAlpha: 'none', colorSpaceConversion: 'none', imageOrientation: 'none' });
   }
 
   /** A texture ready for rendering: one WebGL texture per image of the file. */
@@ -385,6 +386,7 @@
       this.parsed = parsed;
       this.ids = [];
       this.mipDims = [];
+      this.mipLevels = 1;
       this.frames = parsed.frames;
       this.animated = parsed.animated;
       this.spritesheet = parsed.spritesheet;
@@ -412,10 +414,9 @@
       if (!this.video || this.video.readyState < 2) return;
       const gl = this.gl;
       gl.bindTexture(gl.TEXTURE_2D, this.ids[0]);
-      // Video frames are top-down; the texture keeps the bottom-up layout of raw payloads.
-      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, this.video);
+      // Video frames are top-down like raw payloads, their first row at v = 0
       gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, this.video);
       this.videoReady = true;
     }
     setPaused(paused) {
@@ -473,16 +474,15 @@
         const bitmap = await decodeImageBlob(mips[0].data, parsed.payloadMime);
         gl.bindTexture(gl.TEXTURE_2D, id);
         gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
-        // Raw .tex payloads are stored bottom-up (first row at v=0, as linux-wallpaperengine
-        // uploads them); decoded image files arrive top-down, so they are flipped to match.
-        gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+        // Raw .tex payloads are stored top-down with their first row at v = 0, which the bitmap matches
         gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, bitmap);
-        gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
         tex.mipDims.push([bitmap.width, bitmap.height]);
+        tex.mipLevels = 1;
         bitmap.close();
         applySampling(gl, parsed.flags, 1);
       } else {
         const compressed = isDxt && s3tc && mips.every((m) => m.width % 4 === 0 && m.height % 4 === 0);
+        tex.mipLevels = mips.length;
         for (let level = 0; level < mips.length; level++) {
           const mip = mips[level];
           if (level === 0) tex.mipDims.push([mip.width, mip.height]);

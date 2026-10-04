@@ -2,7 +2,7 @@
 
 use crate::content::{Content, ContentEvent, ContentId, PointerEvent, PointerKind, Seek};
 use crate::error::{Error, Result};
-use crate::model::props::ControlKind;
+use crate::model::props::{ControlKind, FIT_CONTROL};
 use crate::model::settings::Scaler;
 use crate::model::{Control, Kind};
 use crate::msg::Msg;
@@ -37,7 +37,7 @@ pub fn spawn(
         ("Impl", Val::Str(shell.impl_name().to_string())),
         ("Kind", Val::Str(kind.to_string())),
         ("Title", Val::Str(wp.title())),
-        ("Fit", Val::Str(fit_name(spec.settings.video.scaler).into())),
+        ("Fit", Val::Str(spec.settings.video.scaler.name().into())),
         ("Paused", Val::Bool(false)),
         ("Muted", Val::Bool(!spec.audio)),
         ("Volume", Val::Num(spec.volume.min(100) as f64 / 100.0)),
@@ -184,15 +184,6 @@ fn next_generation() -> i64 {
     })
     .map(|last| if now > last { now } else { last + 1 })
     .unwrap_or(now)
-}
-
-fn fit_name(scaler: Scaler) -> &'static str {
-    match scaler {
-        Scaler::None => "none",
-        Scaler::Fill => "fill",
-        Scaler::Uniform => "uniform",
-        Scaler::UniformFill => "uniformfill",
-    }
 }
 
 fn file_url(path: &str) -> String {
@@ -391,6 +382,13 @@ impl Content for PlasmaContent {
 
     fn apply(&mut self, name: &str, control: &Control, value: Option<&Value>) {
         if self.we {
+            if name == FIT_CONTROL {
+                if let Some(i) = value.and_then(Value::as_i64) {
+                    let data = serde_json::json!({ "fit": Scaler::from_index(i).name() });
+                    self.push("general", &data.to_string(), Some("fit"));
+                }
+                return;
+            }
             let Some(update) =
                 web::we_apply(self.root.as_deref(), &self.grants, name, control, value)
             else {
@@ -441,9 +439,9 @@ impl Content for PlasmaContent {
                     self.write(&[("LoopBlend", Val::Num(v.max(0.0)))]);
                 }
             }
-            "scaler" => {
+            FIT_CONTROL => {
                 if let Some(i) = value.as_i64() {
-                    self.write(&[("Fit", Val::Str(fit_name(Scaler::from_index(i)).into()))]);
+                    self.write(&[("Fit", Val::Str(Scaler::from_index(i).name().into()))]);
                 }
             }
             "mute" => {

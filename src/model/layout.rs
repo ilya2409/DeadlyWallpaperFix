@@ -100,6 +100,9 @@ pub struct Layout {
     pub shared: Option<String>,
     /// The spanning image, relative to the desktop's bounds.
     pub image: Pose,
+    /// Each display's own image in the per-display and duplicate arrangements, relative to
+    /// the display.
+    pub images: Vec<Alignment>,
     /// Each display, relative to where the desktop reports it.
     pub alignment: Vec<Alignment>,
 }
@@ -114,8 +117,9 @@ pub struct Placement {
     pub slot: String,
     /// Whether this instance is the one that carries audio.
     pub audio: bool,
-    /// The instance shows its display's part of the spanning image, see [`Layout::view_for`].
-    pub spanning: bool,
+    /// The instance shows its display's view of the image under the layout's poses, see
+    /// [`Layout::view_for`]; otherwise all of its region as it is.
+    pub aligned: bool,
 }
 
 impl Layout {
@@ -185,8 +189,35 @@ impl Layout {
             .unwrap_or_default()
     }
 
-    pub fn set_image_pose(&mut self, pose: Pose) {
-        self.image = pose.normalized();
+    /// The image `display` shows: the spanning image, or in the other arrangements its own.
+    pub fn image_pose(&self, display: &str) -> Pose {
+        match self.arrangement {
+            Arrangement::Span => self.image,
+            _ => self
+                .images
+                .iter()
+                .find(|a| a.display == display)
+                .map(|a| a.pose)
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Place the image `display` shows; the identity pose puts a display's own image back
+    /// over the display.
+    pub fn set_image_pose(&mut self, display: &str, pose: Pose) {
+        let pose = pose.normalized();
+        match self.arrangement {
+            Arrangement::Span => self.image = pose,
+            _ => {
+                self.images.retain(|a| a.display != display);
+                if !pose.is_identity() {
+                    self.images.push(Alignment {
+                        display: display.into(),
+                        pose,
+                    });
+                }
+            }
+        }
     }
 
     /// Place `display`; the identity pose puts it back where the desktop reports it.
@@ -203,12 +234,16 @@ impl Layout {
 
     pub fn reset_alignment(&mut self) {
         self.image = Pose::default();
+        self.images.clear();
         self.alignment.clear();
     }
 
-    /// Whether the image or any connected display has been moved, scaled or rotated.
+    /// Whether the image a connected display shows, or the display itself, has been moved,
+    /// scaled or rotated.
     pub fn is_aligned(&self, displays: &[Display]) -> bool {
-        !self.image.is_identity() || displays.iter().any(|d| !self.pose(&d.id).is_identity())
+        displays
+            .iter()
+            .any(|d| !self.image_pose(&d.id).is_identity() || !self.pose(&d.id).is_identity())
     }
 
     /// The spanning image's extent before any pose: the desktop's bounds.
@@ -216,10 +251,20 @@ impl Layout {
         Rect::bounds(displays.iter().map(|d| &d.rect))
     }
 
-    /// What `d` shows of the spanning image whose extent is `bounds`: the image transform
-    /// composed with the inverse of the display's own.
-    pub fn view_for(&self, d: &Display, bounds: Rect) -> View {
-        let image = self.image;
+    /// The extent of the image `d` shows before any pose: the desktop's bounds when
+    /// spanning, else the display itself.
+    pub fn image_bounds(&self, d: &Display, displays: &[Display]) -> Rect {
+        match self.arrangement {
+            Arrangement::Span => Layout::span_bounds(displays),
+            _ => d.rect,
+        }
+    }
+
+    /// What `d` shows of its image: the image transform composed with the inverse of the
+    /// display's own.
+    pub fn view_for(&self, d: &Display, displays: &[Display]) -> View {
+        let bounds = self.image_bounds(d, displays);
+        let image = self.image_pose(&d.id);
         let own = self.pose(&d.id);
         let (ci_x, ci_y) = (
             bounds.x as f64 + bounds.w as f64 / 2.0 + image.x,
@@ -287,7 +332,7 @@ impl Layout {
                         region: d.rect,
                         slot: d.id.clone(),
                         audio: true,
-                        spanning: false,
+                        aligned: true,
                     })
                 })
                 .collect(),
@@ -303,7 +348,7 @@ impl Layout {
                         region,
                         slot: "span".into(),
                         audio: true,
-                        spanning: false,
+                        aligned: false,
                     }]
                 } else {
                     displays
@@ -314,7 +359,7 @@ impl Layout {
                             region: d.rect,
                             slot: "span".into(),
                             audio: d.id == primary.id,
-                            spanning: true,
+                            aligned: true,
                         })
                         .collect()
                 }
@@ -331,7 +376,7 @@ impl Layout {
                         region: d.rect,
                         slot: "duplicate".into(),
                         audio: d.id == primary.id,
-                        spanning: false,
+                        aligned: true,
                     })
                     .collect()
             }
@@ -372,7 +417,7 @@ mod tests {
         let p = l.plan(&displays(), true);
         assert_eq!(p.len(), 1);
         assert_eq!(p[0].slot, "a");
-        assert!(p[0].audio);
+        assert!(p[0].audio && p[0].aligned);
         assert_eq!(l.per.len(), 2);
     }
 
@@ -386,10 +431,10 @@ mod tests {
         let one = l.plan(&displays(), true);
         assert_eq!(one.len(), 1);
         assert_eq!(one[0].region, Rect::new(0, 0, 3000, 1920));
-        assert!(!one[0].spanning);
+        assert!(!one[0].aligned);
         let many = l.plan(&displays(), false);
         assert_eq!(many.len(), 2);
-        assert!(many.iter().all(|p| p.slot == "span" && p.spanning));
+        assert!(many.iter().all(|p| p.slot == "span" && p.aligned));
         assert_eq!(
             many.iter().find(|p| p.display == "b").unwrap().region,
             Rect::new(1920, 0, 1080, 1920)
@@ -414,7 +459,7 @@ mod tests {
         assert_eq!(bounds, Rect::new(0, 0, 3000, 1920));
 
         // Untouched: b's top-left corner shows image pixel (1920, 0).
-        let v = l.view_for(b, bounds);
+        let v = l.view_for(b, &ds);
         assert!(v.is_plain());
         assert_eq!(v.to_image(slot, 0.0, 0.0), (1920.0, 0.0));
 
@@ -432,10 +477,7 @@ mod tests {
             2,
             "posed displays need one instance each"
         );
-        assert_eq!(
-            l.view_for(b, bounds).to_image(slot, 0.0, 0.0),
-            (1920.0, 200.0)
-        );
+        assert_eq!(l.view_for(b, &ds).to_image(slot, 0.0, 0.0), (1920.0, 200.0));
 
         // b rotated a quarter turn: its centre still shows the same image pixel, its corner
         // shows what lies a quarter turn away.
@@ -446,7 +488,7 @@ mod tests {
                 ..Pose::default()
             },
         );
-        let v = l.view_for(b, bounds);
+        let v = l.view_for(b, &ds);
         assert_eq!(v.rotation, -90.0);
         let (cx, cy) = v.to_image(slot, 540.0, 960.0);
         assert!((cx - 2460.0).abs() < 1e-6 && (cy - 960.0).abs() < 1e-6);
@@ -458,11 +500,14 @@ mod tests {
 
         // The image scaled up twice shows half as much per display.
         l.reset_alignment();
-        l.set_image_pose(Pose {
-            scale: 2.0,
-            ..Pose::default()
-        });
-        let v = l.view_for(b, bounds);
+        l.set_image_pose(
+            "a",
+            Pose {
+                scale: 2.0,
+                ..Pose::default()
+            },
+        );
+        let v = l.view_for(b, &ds);
         assert_eq!(v.scale, 2.0);
         let (x, y) = v.to_image(slot, 540.0, 960.0);
         assert!(
@@ -473,6 +518,69 @@ mod tests {
         l.reset_alignment();
         assert!(!l.is_aligned(&ds));
         assert_eq!(l.plan(&ds, true).len(), 1);
+    }
+
+    #[test]
+    fn per_display_images_pose_over_their_own_display() {
+        let ds = displays();
+        let b = &ds[1];
+        let slot = crate::geom::Size {
+            w: b.rect.w,
+            h: b.rect.h,
+        };
+        let mut l = Layout::default();
+        l.assign("a", "w1");
+        l.assign("b", "w2");
+        let v = l.view_for(b, &ds);
+        assert!(
+            v.is_whole(slot),
+            "an untouched display shows its whole image"
+        );
+
+        // b's image twice as big: its centre still shows the image centre, its corner a quarter in.
+        l.set_image_pose(
+            "b",
+            Pose {
+                scale: 2.0,
+                ..Pose::default()
+            },
+        );
+        assert!(l.is_aligned(&ds));
+        assert_eq!(l.image_pose("b").scale, 2.0);
+        assert!(
+            l.image_pose("a").is_identity(),
+            "images are each display's own"
+        );
+        let v = l.view_for(b, &ds);
+        assert_eq!((v.width, v.height), (1080, 1920));
+        assert_eq!(v.to_image(slot, 540.0, 960.0), (540.0, 960.0));
+        assert_eq!(v.to_image(slot, 0.0, 0.0), (270.0, 480.0));
+
+        // b itself 200 px lower than the desktop says: its corner shows the image 200 px down.
+        l.set_image_pose("b", Pose::default());
+        l.set_display_pose(
+            "b",
+            Pose {
+                y: 200.0,
+                ..Pose::default()
+            },
+        );
+        assert_eq!(l.view_for(b, &ds).to_image(slot, 0.0, 0.0), (0.0, 200.0));
+        assert!(l.plan(&ds, true).iter().all(|p| p.aligned));
+
+        // The display poses carry over to spanning, the per-display images stay behind.
+        l.set_image_pose(
+            "a",
+            Pose {
+                x: 5.0,
+                ..Pose::default()
+            },
+        );
+        l.set_arrangement(Arrangement::Span, Some("a"));
+        assert_eq!(l.pose("b").y, 200.0);
+        assert!(l.image_pose("a").is_identity());
+        l.reset_alignment();
+        assert!(l.images.is_empty() && l.alignment.is_empty());
     }
 
     #[test]

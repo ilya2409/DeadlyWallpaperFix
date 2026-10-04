@@ -29,6 +29,11 @@ pub fn get(name: &str) -> Option<(&'static str, &'static [u8])> {
             include_bytes!("../../assets/we/props.js"),
         ),
         (
+            "glsl.js",
+            "text/javascript; charset=utf-8",
+            include_bytes!("../../assets/we/glsl.js"),
+        ),
+        (
             "shader.js",
             "text/javascript; charset=utf-8",
             include_bytes!("../../assets/we/shader.js"),
@@ -69,6 +74,16 @@ pub fn get(name: &str) -> Option<(&'static str, &'static [u8])> {
             include_bytes!("../../assets/we/objects.js"),
         ),
         (
+            "lighting.js",
+            "text/javascript; charset=utf-8",
+            include_bytes!("../../assets/we/lighting.js"),
+        ),
+        (
+            "hdrbloom.js",
+            "text/javascript; charset=utf-8",
+            include_bytes!("../../assets/we/hdrbloom.js"),
+        ),
+        (
             "image.js",
             "text/javascript; charset=utf-8",
             include_bytes!("../../assets/we/image.js"),
@@ -102,6 +117,11 @@ pub fn get(name: &str) -> Option<(&'static str, &'static [u8])> {
             "puppet.js",
             "text/javascript; charset=utf-8",
             include_bytes!("../../assets/we/puppet.js"),
+        ),
+        (
+            "model.js",
+            "text/javascript; charset=utf-8",
+            include_bytes!("../../assets/we/model.js"),
         ),
         (
             "puppetwarp.js",

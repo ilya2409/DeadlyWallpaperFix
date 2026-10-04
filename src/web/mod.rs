@@ -10,7 +10,8 @@ use crate::audio::Spectrum;
 use crate::content::{Content, ContentEvent, ContentId, PointerEvent, PointerKind, Seek, View};
 use crate::error::{Error, Result};
 use crate::geom::Size;
-use crate::model::props::ControlKind;
+use crate::model::props::{ControlKind, FIT_CONTROL};
+use crate::model::settings::Scaler;
 use crate::model::{Control, Kind};
 use crate::msg::Msg;
 use crate::platform::{ContentSpec, MsgSender, MsgSenderApi};
@@ -759,6 +760,15 @@ impl Content for WebContent {
 
     fn apply(&mut self, name: &str, control: &Control, value: Option<&Value>) {
         if self.we {
+            if name == FIT_CONTROL {
+                if let Some(i) = value.and_then(Value::as_i64) {
+                    self.eval(&format!(
+                        "__dwp.general({{fit: {}}})",
+                        js(&Value::String(Scaler::from_index(i).name().into()))
+                    ));
+                }
+                return;
+            }
             let Some(update) = we_apply(self.root.as_deref(), &self.grants, name, control, value)
             else {
                 return;

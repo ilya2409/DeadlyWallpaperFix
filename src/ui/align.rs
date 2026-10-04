@@ -1,4 +1,4 @@
-//! Interactive alignment of a spanning wallpaper and its displays.
+//! Interactive alignment of displays and the wallpapers they show.
 
 use crate::geom::Rect as GeomRect;
 use crate::model::{Display, Kind, Layout, Pose};
@@ -10,27 +10,37 @@ use eframe::egui::{
 };
 use eframe::epaint::{Mesh, Vertex, WHITE_UV};
 
-pub struct Scene<'a> {
-    pub displays: &'a [Display],
-    pub layout: &'a Layout,
-    /// Thumbnail of the shared wallpaper, drawn as the image.
-    pub thumbnail: Option<&'a str>,
+/// A wallpaper image the editor places: the spanning one over the desktop, or one display's own.
+pub struct Image {
+    /// The display whose own image this is; `None` for the spanning image, shown by every display.
+    pub display: Option<String>,
+    /// Its extent before any pose.
+    pub base: GeomRect,
+    pub pose: Pose,
+    /// Thumbnail URI of the wallpaper, drawn as the image.
+    pub thumbnail: Option<String>,
     pub kind: Option<Kind>,
-    pub selected: Option<&'a str>,
     /// Whether the running wallpaper can be scaled or turned on this desktop.
     pub scalable: bool,
     pub rotatable: bool,
 }
 
+pub struct Scene<'a> {
+    pub displays: &'a [Display],
+    pub layout: &'a Layout,
+    pub images: &'a [Image],
+    pub selected: Option<&'a str>,
+}
+
 pub enum Event {
     Clicked(String),
-    Image(Pose),
+    Image { display: Option<String>, pose: Pose },
     Display { id: String, pose: Pose },
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Target {
-    Image,
+    Image(usize),
     Display(usize),
 }
 
@@ -51,7 +61,7 @@ struct Drag {
     pose: Pose,
 }
 
-/// A rectangle placed in span space: its base under a pose.
+/// A rectangle placed in desktop space: its base under a pose.
 #[derive(Clone, Copy, Debug)]
 struct Placed {
     cx: f64,
@@ -74,7 +84,7 @@ impl Placed {
         }
     }
 
-    /// Local (centred, unscaled, unturned) to span space.
+    /// Local (centred, unscaled, unturned) to desktop space.
     fn out(&self, lx: f64, ly: f64) -> (f64, f64) {
         let (s, c) = self.rotation.to_radians().sin_cos();
         let (x, y) = (lx * self.scale, ly * self.scale);
@@ -116,6 +126,26 @@ const ROTATE_ARM: f32 = 28.0;
 /// Snap distance in screen pixels.
 const SNAP_PX: f64 = 12.0;
 
+/// Whether image `image` is shown by display `display`.
+fn shown_by(scene: &Scene<'_>, image: usize, display: usize) -> bool {
+    scene.images[image]
+        .display
+        .as_deref()
+        .is_none_or(|id| id == scene.displays[display].id)
+}
+
+/// How far a target may be transformed: an image as its wallpaper allows, a display as the
+/// image it shows allows.
+fn limits(scene: &Scene<'_>, target: Target) -> (bool, bool) {
+    let image = match target {
+        Target::Image(i) => Some(i),
+        Target::Display(d) => (0..scene.images.len()).find(|&i| shown_by(scene, i, d)),
+    };
+    image.map_or((true, true), |i| {
+        (scene.images[i].scalable, scene.images[i].rotatable)
+    })
+}
+
 pub fn editor(ui: &mut egui::Ui, scene: &Scene<'_>, max_size: Vec2) -> Option<Event> {
     let p = theme::palette(ui);
     if scene.displays.is_empty() {
@@ -124,22 +154,24 @@ pub fn editor(ui: &mut egui::Ui, scene: &Scene<'_>, max_size: Vec2) -> Option<Ev
     }
     let id = ui.id().with("span-editor");
     let drag: Option<Drag> = ui.data(|m| m.get_temp(id.with("drag")));
-    let image_selected: bool = ui.data(|m| m.get_temp(id.with("image"))).unwrap_or(false);
-    let bounds = Layout::span_bounds(scene.displays);
+    let image_selected: Option<usize> = ui
+        .data(|m| m.get_temp::<Option<usize>>(id.with("image")))
+        .flatten()
+        .filter(|i| *i < scene.images.len());
 
     // Committed placements set the scale of the scene, so nothing jumps while dragging.
-    let image_home = Placed::new(bounds, scene.layout.image);
+    let image_homes: Vec<Placed> = scene
+        .images
+        .iter()
+        .map(|im| Placed::new(im.base, im.pose))
+        .collect();
     let homes: Vec<Placed> = scene
         .displays
         .iter()
         .map(|d| Placed::new(d.rect, scene.layout.pose(&d.id)))
         .collect();
     let (mut min, mut max) = ((f64::MAX, f64::MAX), (f64::MIN, f64::MIN));
-    for (x, y) in homes
-        .iter()
-        .chain(std::iter::once(&image_home))
-        .flat_map(Placed::corners)
-    {
+    for (x, y) in homes.iter().chain(&image_homes).flat_map(Placed::corners) {
         min = (min.0.min(x), min.1.min(y));
         max = (max.0.max(x), max.1.max(y));
     }
@@ -160,7 +192,7 @@ pub fn editor(ui: &mut egui::Ui, scene: &Scene<'_>, max_size: Vec2) -> Option<Ev
             origin.y + ((y - min.1) * scale) as f32,
         )
     };
-    let to_span = move |pos: Pos2| {
+    let to_desktop = move |pos: Pos2| {
         (
             min.0 + (pos.x - origin.x) as f64 / scale,
             min.1 + (pos.y - origin.y) as f64 / scale,
@@ -169,11 +201,17 @@ pub fn editor(ui: &mut egui::Ui, scene: &Scene<'_>, max_size: Vec2) -> Option<Ev
     let pointer = resp
         .interact_pointer_pos()
         .or_else(|| ui.input(|i| i.pointer.hover_pos()));
+    let committed = |target: Target| -> Pose {
+        match target {
+            Target::Image(i) => scene.images[i].pose,
+            Target::Display(i) => scene.layout.pose(&scene.displays[i].id),
+        }
+    };
 
     // Poses as shown this frame: the committed ones, with the dragged one following the pointer.
     let live = |drag: &Drag, pointer: Pos2| -> Pose {
         let home = match drag.target {
-            Target::Image => image_home,
+            Target::Image(i) => image_homes[i],
             Target::Display(i) => homes[i],
         };
         let center = to_screen(home.cx, home.cy);
@@ -213,7 +251,7 @@ pub fn editor(ui: &mut egui::Ui, scene: &Scene<'_>, max_size: Vec2) -> Option<Ev
             }
         }
     };
-    let mut image_pose = scene.layout.image;
+    let mut image_poses: Vec<Pose> = scene.images.iter().map(|im| im.pose).collect();
     let mut poses: Vec<Pose> = scene
         .displays
         .iter()
@@ -222,25 +260,29 @@ pub fn editor(ui: &mut egui::Ui, scene: &Scene<'_>, max_size: Vec2) -> Option<Ev
     if let (Some(d), Some(pos)) = (drag, pointer) {
         let pose = live(&d, pos);
         match d.target {
-            Target::Image => image_pose = pose,
+            Target::Image(i) => image_poses[i] = pose,
             Target::Display(i) => poses[i] = pose,
         }
         ui.ctx().request_repaint();
     }
-    let image = Placed::new(bounds, image_pose);
+    let images: Vec<Placed> = scene
+        .images
+        .iter()
+        .zip(&image_poses)
+        .map(|(im, pose)| Placed::new(im.base, *pose))
+        .collect();
     let placed: Vec<Placed> = scene
         .displays
         .iter()
         .zip(&poses)
         .map(|(d, pose)| Placed::new(d.rect, *pose))
         .collect();
-    let selected_target = if image_selected {
-        Some(Target::Image)
-    } else {
-        scene
+    let selected_target = match image_selected {
+        Some(i) => Some(Target::Image(i)),
+        None => scene
             .selected
             .and_then(|id| scene.displays.iter().position(|d| d.id == id))
-            .map(Target::Display)
+            .map(Target::Display),
     };
 
     let handle_points = |placed: &Placed| -> ([Pos2; 4], Pos2) {
@@ -259,25 +301,28 @@ pub fn editor(ui: &mut egui::Ui, scene: &Scene<'_>, max_size: Vec2) -> Option<Ev
     let hit = |pos: Pos2| -> Option<(Target, Mode)> {
         if let Some(t) = selected_target {
             let home = match t {
-                Target::Image => image_home,
+                Target::Image(i) => image_homes[i],
                 Target::Display(i) => homes[i],
             };
+            let (scalable, rotatable) = limits(scene, t);
             let (corners, rotate) = handle_points(&home);
-            if scene.rotatable && pos.distance(rotate) <= HANDLE + 4.0 {
+            if rotatable && pos.distance(rotate) <= HANDLE + 4.0 {
                 return Some((t, Mode::Rotate));
             }
-            if scene.scalable && corners.iter().any(|c| pos.distance(*c) <= HANDLE + 4.0) {
+            if scalable && corners.iter().any(|c| pos.distance(*c) <= HANDLE + 4.0) {
                 return Some((t, Mode::Scale));
             }
         }
-        let (x, y) = to_span(pos);
+        let (x, y) = to_desktop(pos);
         for (i, d) in homes.iter().enumerate().rev() {
             if d.contains(x, y) {
                 return Some((Target::Display(i), Mode::Move));
             }
         }
-        if image_home.contains(x, y) {
-            return Some((Target::Image, Mode::Move));
+        for (i, im) in image_homes.iter().enumerate().rev() {
+            if im.contains(x, y) {
+                return Some((Target::Image(i), Mode::Move));
+            }
         }
         None
     };
@@ -286,10 +331,7 @@ pub fn editor(ui: &mut egui::Ui, scene: &Scene<'_>, max_size: Vec2) -> Option<Ev
     if resp.drag_started() {
         if let Some(start) = ui.input(|i| i.pointer.press_origin()).or(pointer) {
             if let Some((target, mode)) = hit(start) {
-                let pose = match target {
-                    Target::Image => scene.layout.image,
-                    Target::Display(i) => scene.layout.pose(&scene.displays[i].id),
-                };
+                let pose = committed(target);
                 ui.data_mut(|m| {
                     m.insert_temp(
                         id.with("drag"),
@@ -301,7 +343,11 @@ pub fn editor(ui: &mut egui::Ui, scene: &Scene<'_>, max_size: Vec2) -> Option<Ev
                         },
                     )
                 });
-                ui.data_mut(|m| m.insert_temp(id.with("image"), target == Target::Image));
+                let image = match target {
+                    Target::Image(i) => Some(i),
+                    Target::Display(_) => None,
+                };
+                ui.data_mut(|m| m.insert_temp(id.with("image"), image));
                 if let Target::Display(i) = target {
                     event = Some(Event::Clicked(scene.displays[i].id.clone()));
                 }
@@ -311,13 +357,12 @@ pub fn editor(ui: &mut egui::Ui, scene: &Scene<'_>, max_size: Vec2) -> Option<Ev
         if let (Some(d), Some(pos)) = (drag, pointer) {
             ui.data_mut(|m| m.remove::<Drag>(id.with("drag")));
             let pose = live(&d, pos);
-            let committed = match d.target {
-                Target::Image => scene.layout.image,
-                Target::Display(i) => scene.layout.pose(&scene.displays[i].id),
-            };
-            if pose != committed {
+            if pose != committed(d.target) {
                 event = Some(match d.target {
-                    Target::Image => Event::Image(pose),
+                    Target::Image(i) => Event::Image {
+                        display: scene.images[i].display.clone(),
+                        pose,
+                    },
                     Target::Display(i) => Event::Display {
                         id: scene.displays[i].id.clone(),
                         pose,
@@ -329,11 +374,11 @@ pub fn editor(ui: &mut egui::Ui, scene: &Scene<'_>, max_size: Vec2) -> Option<Ev
         if let Some(pos) = resp.interact_pointer_pos() {
             match hit(pos) {
                 Some((Target::Display(i), _)) => {
-                    ui.data_mut(|m| m.insert_temp(id.with("image"), false));
+                    ui.data_mut(|m| m.insert_temp(id.with("image"), None::<usize>));
                     event = Some(Event::Clicked(scene.displays[i].id.clone()));
                 }
-                Some((Target::Image, _)) => {
-                    ui.data_mut(|m| m.insert_temp(id.with("image"), true));
+                Some((Target::Image(i), _)) => {
+                    ui.data_mut(|m| m.insert_temp(id.with("image"), Some(i)));
                 }
                 None => {}
             }
@@ -341,20 +386,33 @@ pub fn editor(ui: &mut egui::Ui, scene: &Scene<'_>, max_size: Vec2) -> Option<Ev
     }
 
     let painter = ui.painter();
-    let texture = scene.thumbnail.and_then(|uri| {
-        match ui
-            .ctx()
-            .try_load_texture(uri, TextureOptions::LINEAR, SizeHint::default())
-        {
-            Ok(TexturePoll::Ready { texture }) => Some(texture),
-            _ => None,
-        }
-    });
-    let uv_rect = texture
-        .map(|t| widgets::cover_uv(t.size, egui::vec2(bounds.w as f32, bounds.h as f32)))
-        .unwrap_or(Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)));
-    let fill = theme::kind_color(scene.kind.unwrap_or(Kind::Picture), p.dark);
-    let mesh_of = |points: &[(f64, f64)], brightness: f32| -> Mesh {
+    let textures: Vec<Option<egui::load::SizedTexture>> = scene
+        .images
+        .iter()
+        .map(|im| {
+            im.thumbnail.as_deref().and_then(|uri| {
+                match ui
+                    .ctx()
+                    .try_load_texture(uri, TextureOptions::LINEAR, SizeHint::default())
+                {
+                    Ok(TexturePoll::Ready { texture }) => Some(texture),
+                    _ => None,
+                }
+            })
+        })
+        .collect();
+    let uv_rects: Vec<Rect> = textures
+        .iter()
+        .zip(scene.images)
+        .map(|(t, im)| {
+            t.map(|t| widgets::cover_uv(t.size, egui::vec2(im.base.w as f32, im.base.h as f32)))
+                .unwrap_or(Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)))
+        })
+        .collect();
+    let mesh_of = |i: usize, points: &[(f64, f64)], brightness: f32| -> Mesh {
+        let texture = textures[i];
+        let image = &images[i];
+        let fill = theme::kind_color(scene.images[i].kind.unwrap_or(Kind::Picture), p.dark);
         let mut mesh = match texture {
             Some(t) => Mesh::with_texture(t.id),
             None => Mesh::default(),
@@ -365,6 +423,7 @@ pub fn editor(ui: &mut egui::Ui, scene: &Scene<'_>, max_size: Vec2) -> Option<Ev
                     let (lx, ly) = image.local(x, y);
                     let u = (lx / image.w + 0.5) as f32;
                     let v = (ly / image.h + 0.5) as f32;
+                    let uv_rect = uv_rects[i];
                     (
                         Pos2::new(
                             uv_rect.min.x + u * uv_rect.width(),
@@ -394,7 +453,7 @@ pub fn editor(ui: &mut egui::Ui, scene: &Scene<'_>, max_size: Vec2) -> Option<Ev
             .collect()
     };
 
-    // Blank screens under everything, the whole image dimmed, then each screen's part bright.
+    // Blank screens under everything, every image dimmed, then each screen's part bright.
     let blank = if p.dark {
         Color32::from_rgb(12, 12, 14)
     } else {
@@ -403,22 +462,41 @@ pub fn editor(ui: &mut egui::Ui, scene: &Scene<'_>, max_size: Vec2) -> Option<Ev
     for d in &placed {
         painter.add(Shape::convex_polygon(screen_poly(d), blank, Stroke::NONE));
     }
-    let image_corners = image.corners();
-    painter.add(Shape::mesh(mesh_of(&image_corners, 0.35)));
-    for d in &placed {
-        let part = clip_convex(&image_corners, &d.corners());
-        if part.len() >= 3 {
-            painter.add(Shape::mesh(mesh_of(&part, 1.0)));
+    for (i, image) in images.iter().enumerate() {
+        painter.add(Shape::mesh(mesh_of(i, &image.corners(), 0.35)));
+    }
+    for (di, d) in placed.iter().enumerate() {
+        let mut shown = false;
+        for (i, image) in images.iter().enumerate() {
+            if !shown_by(scene, i, di) {
+                continue;
+            }
+            shown = true;
+            let part = clip_convex(&image.corners(), &d.corners());
+            if part.len() >= 3 {
+                painter.add(Shape::mesh(mesh_of(i, &part, 1.0)));
+            }
+        }
+        if !shown {
+            painter.text(
+                to_screen(d.cx, d.cy),
+                Align2::CENTER_CENTER,
+                "No wallpaper",
+                FontId::proportional(12.0),
+                p.text_faint,
+            );
         }
     }
-    if texture.is_none() {
-        painter.text(
-            to_screen(image.cx, image.cy),
-            Align2::CENTER_CENTER,
-            theme::kind_glyph(scene.kind.unwrap_or(Kind::Picture)),
-            FontId::proportional(28.0),
-            theme::kind_glyph_color(p.dark),
-        );
+    for (i, image) in images.iter().enumerate() {
+        if textures[i].is_none() {
+            painter.text(
+                to_screen(image.cx, image.cy),
+                Align2::CENTER_CENTER,
+                theme::kind_glyph(scene.images[i].kind.unwrap_or(Kind::Picture)),
+                FontId::proportional(28.0),
+                theme::kind_glyph_color(p.dark),
+            );
+        }
     }
 
     let hover = if drag.is_some() {
@@ -426,12 +504,14 @@ pub fn editor(ui: &mut egui::Ui, scene: &Scene<'_>, max_size: Vec2) -> Option<Ev
     } else {
         pointer.filter(|pos| area.contains(*pos)).and_then(hit)
     };
-    let image_stroke = if selected_target == Some(Target::Image) {
-        Stroke::new(2.0, p.accent)
-    } else {
-        Stroke::new(1.0, p.stroke_strong)
-    };
-    painter.add(Shape::closed_line(screen_poly(&image), image_stroke));
+    for (i, image) in images.iter().enumerate() {
+        let stroke = if selected_target == Some(Target::Image(i)) {
+            Stroke::new(2.0, p.accent)
+        } else {
+            Stroke::new(1.0, p.stroke_strong)
+        };
+        painter.add(Shape::closed_line(screen_poly(image), stroke));
+    }
     for (i, d) in placed.iter().enumerate() {
         let is_selected = selected_target == Some(Target::Display(i));
         let hovered = matches!(hover, Some((Target::Display(j), Mode::Move)) if j == i);
@@ -461,11 +541,12 @@ pub fn editor(ui: &mut egui::Ui, scene: &Scene<'_>, max_size: Vec2) -> Option<Ev
 
     if let Some(t) = selected_target {
         let target = match t {
-            Target::Image => image,
+            Target::Image(i) => images[i],
             Target::Display(i) => placed[i],
         };
+        let (scalable, rotatable) = limits(scene, t);
         let (corners, rotate) = handle_points(&target);
-        if scene.scalable {
+        if scalable {
             for c in corners {
                 painter.rect(
                     Rect::from_center_size(c, egui::vec2(HANDLE, HANDLE)),
@@ -476,7 +557,7 @@ pub fn editor(ui: &mut egui::Ui, scene: &Scene<'_>, max_size: Vec2) -> Option<Ev
                 );
             }
         }
-        if scene.rotatable {
+        if rotatable {
             let (tx, ty) = target.out(0.0, -target.h / 2.0);
             painter.line_segment([to_screen(tx, ty), rotate], Stroke::new(1.0, p.accent));
             painter.circle(rotate, HANDLE * 0.7, p.elevated, Stroke::new(1.5, p.accent));
@@ -511,8 +592,8 @@ pub fn editor(ui: &mut egui::Ui, scene: &Scene<'_>, max_size: Vec2) -> Option<Ev
             }
             resp.clone().on_hover_text(tip);
         }
-        Some((Target::Image, Mode::Move)) if !image_pose.is_identity() => {
-            resp.clone().on_hover_text(describe(&image_pose));
+        Some((Target::Image(i), Mode::Move)) if !image_poses[i].is_identity() => {
+            resp.clone().on_hover_text(describe(&image_poses[i]));
         }
         _ => {}
     }
@@ -671,5 +752,75 @@ mod tests {
         assert!(placed.contains(placed.cx, placed.cy));
         assert!(!placed.contains(placed.cx + 5000.0, placed.cy));
         assert_eq!((placed.cx, placed.cy), (1070.0, 720.0));
+    }
+
+    fn scene_displays() -> Vec<Display> {
+        vec![
+            Display {
+                id: "a".into(),
+                name: "A".into(),
+                rect: GeomRect::new(0, 0, 1920, 1080),
+                workarea: GeomRect::new(0, 0, 1920, 1080),
+                scale: 1.0,
+                primary: true,
+            },
+            Display {
+                id: "b".into(),
+                name: "B".into(),
+                rect: GeomRect::new(1920, 0, 1080, 1920),
+                workarea: GeomRect::new(1920, 0, 1080, 1920),
+                scale: 1.0,
+                primary: false,
+            },
+        ]
+    }
+
+    fn image(display: Option<&str>, kind: Kind) -> Image {
+        Image {
+            display: display.map(str::to_owned),
+            base: GeomRect::new(0, 0, 10, 10),
+            pose: Pose::default(),
+            thumbnail: None,
+            kind: Some(kind),
+            scalable: kind != Kind::Program,
+            rotatable: kind != Kind::Program,
+        }
+    }
+
+    #[test]
+    fn displays_show_their_own_images_and_take_their_limits() {
+        let displays = scene_displays();
+        let layout = Layout::default();
+        let own = [
+            image(Some("a"), Kind::Program),
+            image(Some("b"), Kind::Video),
+        ];
+        let scene = Scene {
+            displays: &displays,
+            layout: &layout,
+            images: &own,
+            selected: None,
+        };
+        assert!(shown_by(&scene, 0, 0) && !shown_by(&scene, 0, 1));
+        assert!(shown_by(&scene, 1, 1) && !shown_by(&scene, 1, 0));
+        assert_eq!(limits(&scene, Target::Display(0)), (false, false));
+        assert_eq!(limits(&scene, Target::Display(1)), (true, true));
+        assert_eq!(limits(&scene, Target::Image(0)), (false, false));
+        let shared = [image(None, Kind::Web)];
+        let span = Scene {
+            displays: &displays,
+            layout: &layout,
+            images: &shared,
+            selected: None,
+        };
+        assert!(shown_by(&span, 0, 0) && shown_by(&span, 0, 1));
+        assert_eq!(limits(&span, Target::Display(1)), (true, true));
+        let none = Scene {
+            displays: &displays,
+            layout: &layout,
+            images: &[],
+            selected: None,
+        };
+        assert_eq!(limits(&none, Target::Display(0)), (true, true));
     }
 }

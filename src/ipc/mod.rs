@@ -25,8 +25,11 @@ pub enum Request {
         arrangement: Arrangement,
         display: Option<String>,
     },
-    /// Move, scale or rotate the spanning image.
+    /// Move, scale or rotate an image: the spanning one, or in the other arrangements the
+    /// one `display` (the primary display when absent) shows.
     AlignImage {
+        #[serde(default)]
+        display: Option<String>,
         pose: Pose,
     },
     /// Move, scale or rotate one display inside the spanning image; the identity pose puts it
@@ -459,6 +462,7 @@ mod tests {
                 value: serde_json::Value::Null,
             },
             Request::AlignImage {
+                display: None,
                 pose: Pose::default(),
             },
             Request::AlignDisplay {

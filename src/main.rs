@@ -64,10 +64,13 @@ enum Command {
     },
     /// Change how wallpapers map onto displays
     Layout { arrangement: Arrangement },
-    /// Move, scale or rotate the spanning image or one display; --reset clears everything
+    /// Move, scale or rotate an image or one display; --reset clears everything
     Align {
         /// `image`, a display id, or a 1-based display index
         target: Option<String>,
+        /// Display whose own image to place when wallpapers are per display or duplicated
+        #[arg(short, long)]
+        display: Option<String>,
         /// Shift of the centre in pixels
         #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
         x: f64,
@@ -222,6 +225,7 @@ fn client_command(cmd: Command) -> Result<()> {
         },
         Command::Align {
             target,
+            display,
             x,
             y,
             scale,
@@ -236,7 +240,7 @@ fn client_command(cmd: Command) -> Result<()> {
             };
             match (reset, target.as_deref()) {
                 (true, _) => Request::ResetAlignment,
-                (false, Some("image")) => Request::AlignImage { pose },
+                (false, Some("image")) => Request::AlignImage { display, pose },
                 (false, Some(display)) => Request::AlignDisplay {
                     display: display.to_string(),
                     pose,

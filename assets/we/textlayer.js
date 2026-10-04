@@ -27,15 +27,15 @@
       this.animationTime = 0;
       this.flags = G.WETex.FLAG.CLAMP_UVS;
       this.format = G.WETex.FORMAT.RGBA8888;
+      this.mipLevels = 1;
       this.uploads = 0;
     }
-    // Canvas rows run top-down; texture row 0 is the bottom, as .tex images are stored.
+    // Canvas rows run top-down and land with the first row at v = 0, as .tex images are stored
     upload(canvas) {
       const gl = this.gl;
       gl.bindTexture(gl.TEXTURE_2D, this.texture);
-      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, canvas);
       gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, canvas);
       G.WETex.applySampling(gl, this.flags, 1);
       gl.bindTexture(gl.TEXTURE_2D, null);
       this.width = canvas.width;

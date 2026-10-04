@@ -1,5 +1,5 @@
 use crate::ipc::{ActiveInfo, Request, Status};
-use crate::model::{Arrangement, Kind, Summary};
+use crate::model::{Arrangement, Kind, Layout, Summary};
 use crate::ui::{align, theme, widgets};
 use eframe::egui::{self, CornerRadius, RichText, Sense};
 
@@ -99,89 +99,101 @@ pub fn page(
     actions
 }
 
+/// The images the editor places: the shared wallpaper over the desktop when spanning, else
+/// each display's own.
+fn images(v: &View<'_>) -> Vec<align::Image> {
+    let status = v.status;
+    let image = |wallpaper: Option<&Summary>, display: Option<String>, base, pose| {
+        let kind = wallpaper.map(|s| s.kind);
+        align::Image {
+            display,
+            base,
+            pose,
+            thumbnail: wallpaper
+                .and_then(|s| s.thumbnail.as_deref())
+                .map(widgets::thumbnail_uri),
+            kind,
+            scalable: kind != Some(Kind::Program),
+            rotatable: match kind {
+                Some(Kind::Program) => false,
+                Some(k) if k.is_web() => status.capabilities.rotate_web,
+                _ => true,
+            },
+        }
+    };
+    match status.layout.arrangement {
+        Arrangement::Span => {
+            let shared = status
+                .layout
+                .shared
+                .as_deref()
+                .and_then(|id| summary(v.library, id));
+            vec![image(
+                shared,
+                None,
+                Layout::span_bounds(&status.displays),
+                status.layout.image,
+            )]
+        }
+        _ => status
+            .displays
+            .iter()
+            .filter_map(|d| {
+                let id = status.layout.wallpaper_for(&d.id)?;
+                Some(image(
+                    summary(v.library, id),
+                    Some(d.id.clone()),
+                    d.rect,
+                    status.layout.image_pose(&d.id),
+                ))
+            })
+            .collect(),
+    }
+}
+
 fn layout(ui: &mut egui::Ui, v: &View<'_>, height: f32, actions: &mut Vec<Action>) {
     let status = v.status;
-    let spanning = status.layout.arrangement == Arrangement::Span;
     theme::card_compact(ui).show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.horizontal(|ui| {
             theme::section_title(ui, "Display layout");
-            if spanning {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .add_enabled(
-                            status.layout.is_aligned(&status.displays),
-                            theme::secondary_button("Reset alignment"),
-                        )
-                        .clicked()
-                    {
-                        actions.push(Action::Send(Request::ResetAlignment));
-                    }
-                });
-            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add_enabled(
+                        status.layout.is_aligned(&status.displays),
+                        theme::secondary_button("Reset alignment"),
+                    )
+                    .clicked()
+                {
+                    actions.push(Action::Send(Request::ResetAlignment));
+                }
+            });
         });
         ui.add_space(8.0);
         ui.vertical_centered(|ui| {
             let max = egui::vec2(ui.available_width() - 8.0, height);
-            if spanning {
-                let shared = status
-                    .layout
-                    .shared
-                    .as_deref()
-                    .and_then(|id| summary(v.library, id));
-                let kind = shared.map(|s| s.kind);
-                let thumbnail = shared
-                    .and_then(|s| s.thumbnail.as_deref())
-                    .map(widgets::thumbnail_uri);
-                let scene = align::Scene {
-                    displays: &status.displays,
-                    layout: &status.layout,
-                    thumbnail: thumbnail.as_deref(),
-                    kind,
-                    selected: v.selected,
-                    scalable: kind != Some(Kind::Program),
-                    rotatable: match kind {
-                        Some(Kind::Program) => false,
-                        Some(k) if k.is_web() => status.capabilities.rotate_web,
-                        _ => true,
-                    },
-                };
-                match align::editor(ui, &scene, max) {
-                    Some(align::Event::Clicked(id)) => actions.push(Action::Select(id)),
-                    Some(align::Event::Image(pose)) => {
-                        actions.push(Action::Send(Request::AlignImage { pose }))
-                    }
-                    Some(align::Event::Display { id, pose }) => {
-                        actions.push(Action::Send(Request::AlignDisplay { display: id, pose }))
-                    }
-                    None => {}
+            let images = images(v);
+            let scene = align::Scene {
+                displays: &status.displays,
+                layout: &status.layout,
+                images: &images,
+                selected: v.selected,
+            };
+            match align::editor(ui, &scene, max) {
+                Some(align::Event::Clicked(id)) => actions.push(Action::Select(id)),
+                Some(align::Event::Image { display, pose }) => {
+                    actions.push(Action::Send(Request::AlignImage { display, pose }))
                 }
-            } else {
-                let items: Vec<_> = status
-                    .displays
-                    .iter()
-                    .map(|d| {
-                        let active = status.active.iter().find(|a| a.display == d.id);
-                        let s = active.and_then(|a| summary(v.library, &a.wallpaper));
-                        widgets::DiagramItem {
-                            display: d,
-                            thumbnail: s.and_then(|s| s.thumbnail.as_deref()),
-                            kind: active.map(|a| a.kind),
-                            paused: active.is_some_and(|a| a.paused && a.kind != Kind::Picture),
-                        }
-                    })
-                    .collect();
-                if let Some(id) = widgets::display_diagram(ui, &items, v.selected, false, max) {
-                    actions.push(Action::Select(id));
+                Some(align::Event::Display { id, pose }) => {
+                    actions.push(Action::Send(Request::AlignDisplay { display: id, pose }))
                 }
+                None => {}
             }
         });
-        if spanning {
-            theme::hint(
-                ui,
-                "Drag a display or the wallpaper to align it. Use the handles to resize or rotate.",
-            );
-        }
+        theme::hint(
+            ui,
+            "Drag a display or its wallpaper to align them. Use the handles to resize or rotate.",
+        );
     });
     ui.add_space(8.0);
     for (i, display) in status.displays.iter().enumerate() {

@@ -23,12 +23,43 @@
     get animationTime() { return this.current.animationTime; }
     get flags() { return this.current.flags; }
     get format() { return this.current.format; }
+    get mipLevels() { return this.current.mipLevels; }
     textureId(i) { return this.current.textureId(i); }
     textureWidth(i) { return this.current.textureWidth(i); }
     textureHeight(i) { return this.current.textureHeight(i); }
     isReady() { return this.current.isReady(); }
     update() { this.current.update(); }
     setPaused(p) { this.current.setPaused(p); }
+  }
+
+  /** A transparent 1x1 texture standing in for a file the scene names but does not ship. */
+  class MissingTexture {
+    constructor(gl, name) {
+      this.gl = gl;
+      this.name = name;
+      this.texture = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, this.texture);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([0, 0, 0, 0]));
+      G.WETex.applySampling(gl, G.WETex.FLAG.CLAMP_UVS, 1);
+      gl.bindTexture(gl.TEXTURE_2D, null);
+      this.flags = G.WETex.FLAG.CLAMP_UVS;
+      this.format = G.WETex.FORMAT.RGBA8888;
+      this.realWidth = 1;
+      this.realHeight = 1;
+      this.resolution = new Float32Array([1, 1, 1, 1]);
+      this.frames = [{ imageId: 0, frametime: 0, x: 0, y: 0, width1: 1, width2: 1, height2: 1, height1: 1 }];
+      this.animated = false;
+      this.spritesheet = null;
+      this.animationTime = 0;
+      this.mipLevels = 1;
+    }
+    textureId() { return this.texture; }
+    textureWidth() { return 1; }
+    textureHeight() { return 1; }
+    isReady() { return true; }
+    update() {}
+    setPaused() {}
+    dispose() { this.gl.deleteTexture(this.texture); }
   }
 
   class Cache {
@@ -73,7 +104,15 @@
       if (existing) return existing.promise;
       const entry = { ref: null, bytes: null, evaluations: [], promise: null };
       entry.promise = (async () => {
-        const bytes = await this.loader.texture(name);
+        let bytes;
+        try {
+          bytes = await this.loader.texture(name);
+        } catch (e) {
+          // Wallpaper Engine draws a layer whose texture file is absent as transparent
+          console.error('texture ' + name + ' could not be loaded, drawing it transparent: ' + e.message);
+          entry.ref = new TextureRef(name, new MissingTexture(this.gl, name));
+          return entry.ref;
+        }
         const built = await this.buildTexture(name, bytes);
         entry.ref = new TextureRef(name, built.texture);
         entry.evaluations = built.evaluations;
@@ -121,7 +160,7 @@
     }
   }
 
-  const api = { Cache, TextureRef };
+  const api = { Cache, TextureRef, MissingTexture };
   G.WETextures = api;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
 })();

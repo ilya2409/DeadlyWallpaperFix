@@ -7,7 +7,6 @@
   const G = typeof window !== 'undefined' ? window : globalThis;
   const M = G.WEM;
 
-  const LIGHT_SLOTS = 16;
   const BLOOM_ID = -1;
 
   // ---- error overlay ---------------------------------------------------------------------------
@@ -36,26 +35,35 @@
     if (!json || typeof json !== 'object') throw new Error('scene.json is not an object');
     const camera = requireObject(json, 'camera', 'scenes must have a camera section');
     const general = requireObject(json, 'general', 'scenes must have a general section');
-    const projection = requireObject(general, 'orthogonalprojection', 'general section must have orthogonal projection info');
+    // A 3D scene writes a null orthogonal projection and looks through a perspective camera
+    const projection = general.orthogonalprojection && typeof general.orthogonalprojection === 'object' ? general.orthogonalprojection : null;
+    const is3D = projection === null;
     if (!Array.isArray(json.objects)) throw new Error('scene.json: scenes must have an objects section');
     const setting = (obj, prefix, key, kind, dflt, expectColor) => G.WEProps.setting(obj[key], { kind, default: dflt, expectColor: !!expectColor, where: 'scene.json ' + prefix + '.' + key, properties });
     const g = (key, kind, dflt, expectColor) => setting(general, 'general', key, kind, dflt, expectColor);
     const c = (key, kind, dflt) => setting(camera, 'camera', key, kind, dflt);
+    // The editor keeps the camera's depth range and field of view in the general section
+    const cam = (key, kind, dflt) => (general[key] !== undefined ? g(key, kind, dflt) : c(key, kind, dflt));
     const requiredVec3 = (key, message) => {
       if (camera[key] === undefined) throw new Error('scene.json: ' + message);
       return G.WEProps.toVec(camera[key], 3);
     };
-    const isAuto = !!projection.auto;
+    const isAuto = !is3D && !!projection.auto;
     const requiredInt = (key, message) => {
-      if (isAuto) return 0;
+      if (isAuto || is3D) return 0;
       if (typeof projection[key] !== 'number') throw new Error('scene.json: ' + message);
       return Math.trunc(projection[key]);
     };
     return {
+      is3D,
+      hdr: g('hdr', 'bool', false),
+      transparentSorting: g('transparentsorting', 'bool', false),
+      clearEnabled: g('clearenabled', 'bool', true),
       colors: {
         ambient: g('ambientcolor', 'color', [0, 0, 0], true),
         skylight: g('skylightcolor', 'color', [0, 0, 0], true),
         clear: g('clearcolor', 'color', [1, 1, 1], true),
+        bloomTint: g('bloomtint', 'color', [1, 1, 1], true),
       },
       camera: {
         fade: g('camerafade', 'bool', false),
@@ -90,11 +98,14 @@
           width: requiredInt('width', 'projection must have a width'),
           height: requiredInt('height', 'projection must have a height'),
           isAuto,
-          nearz: c('nearz', 'float', 0),
-          farz: c('farz', 'float', 1000),
-          fov: c('fov', 'float', 50),
+          nearz: is3D ? cam('nearz', 'float', 0.01) : c('nearz', 'float', 0),
+          farz: is3D ? cam('farz', 'float', 10000) : c('farz', 'float', 1000),
+          fov: cam('fov', 'float', 50),
+          zoom: g('zoom', 'float', 1),
+          perspectiveOverrideFov: general.perspectiveoverridefov !== undefined ? g('perspectiveoverridefov', 'float', 0) : null,
         },
       },
+      general,
       objects: json.objects,
     };
   }
@@ -120,7 +131,6 @@
 
   const PRESENT_VS = '#version 300 es\nprecision highp float;\nin vec3 a_Position;\nin vec2 a_TexCoord;\nout vec2 v_TexCoord;\nvoid main () {\ngl_Position = vec4 (a_Position, 1.0);\nv_TexCoord = a_TexCoord;\n}';
   const PRESENT_FS = '#version 300 es\nprecision highp float;\nuniform sampler2D g_Texture0;\nuniform float u_Fade;\nin vec2 v_TexCoord;\nout vec4 out_FragColor;\nvoid main () {\nvec4 c = texture (g_Texture0, v_TexCoord);\nout_FragColor = vec4 (c.rgb * u_Fade, 1.0);\n}';
-  const PRESENT_POSITION = new Float32Array([-1, 1, 0, 1, 1, 0, -1, -1, 0, -1, -1, 0, 1, 1, 0, 1, -1, 0]);
 
   class Scene {
     constructor(canvas, loader) {
@@ -144,7 +154,12 @@
       this.startStamp = null;
       this.audio = { left16: new Float32Array(16), right16: new Float32Array(16), left32: new Float32Array(32), right32: new Float32Array(32), left64: new Float32Array(64), right64: new Float32Array(64) };
       this.audioRegistered = false;
-      this.lights = { positions: new Float32Array(3 * LIGHT_SLOTS), colors: new Float32Array(3 * LIGHT_SLOTS), radii: new Float32Array(LIGHT_SLOTS) };
+      this.lights = null;
+      this.is3D = false;
+      this.hdr = false;
+      this.colorFormat = 'rgba8888';
+      this.transparentSorting = false;
+      this.hdrBloom = null;
       this.parallaxDisplacement = new Float32Array(2);
       this.texelSize = new Float32Array(2);
       this.texelSizeHalf = new Float32Array(2);
@@ -181,16 +196,25 @@
       this.data = data;
       this.colors = data.colors;
       this.bloom = data.camera.bloom;
+      this.is3D = data.is3D;
+      this.hdr = data.hdr.getBool();
+      this.colorFormat = this.hdr ? 'rgba16f' : 'rgba8888';
+      this.transparentSorting = data.transparentSorting.getBool();
+      this.clearEnabled = data.clearEnabled.getBool();
       this.camera = new G.WECamera.Camera(Object.assign({}, data.camera.configuration, data.camera.projection));
       let width = data.camera.projection.width, height = data.camera.projection.height;
-      if (data.camera.projection.isAuto) {
-        const dpr = G.devicePixelRatio || 1;
+      const dpr = G.devicePixelRatio || 1;
+      if (this.is3D) {
+        width = Math.max(1, Math.round(G.innerWidth * dpr));
+        height = Math.max(1, Math.round(G.innerHeight * dpr));
+      } else if (data.camera.projection.isAuto) {
         [width, height] = autoProjectionSize(data.objects, Math.round(G.innerWidth * dpr), Math.round(G.innerHeight * dpr));
       }
       if (!(width > 0 && height > 0)) throw new Error('scene.json: orthogonal projection is ' + width + 'x' + height);
       this.width = width;
       this.height = height;
-      this.camera.setOrthogonalProjection(width, height);
+      if (this.is3D) this.camera.setPerspectiveProjection(width, height);
+      else this.camera.setOrthogonalProjection(width, height);
       this.parallax = new G.WECamera.Parallax(data.camera.parallax);
       this.parallaxDisplacement = this.parallax.displacement;
       this.shake = new G.WECamera.Shake(data.camera.shake);
@@ -199,8 +223,11 @@
       this.texelSizeHalf.set([0.5 / width, 0.5 / height]);
       this.screen.set([width, height, width / height, 1]);
       this.setupFramebuffers();
+      this.lights = new G.WELighting.Lights(this);
+      this.lights.plan(data.general, data.objects);
       for (const o of data.objects) await this.createObject(o);
       for (const o of data.objects) this.addObjectToRenderOrder(o);
+      await this.lights.attach();
       // CScene constructor: bloom framebuffers at quarter and eighth resolution
       this.fbos.create('_rt_4FrameBuffer', 'rgba8888', G.WEFBO.FLAG.CLAMP_UVS, [width / 4, height / 4], [width / 4, height / 4]);
       this.fbos.create('_rt_8FrameBuffer', 'rgba8888', G.WEFBO.FLAG.CLAMP_UVS, [width / 8, height / 8], [width / 8, height / 8]);
@@ -232,14 +259,33 @@
       this.properties.apply(seed);
     }
 
-    // CWallpaper::setupFramebuffers + CScene's shadow atlas
+    // CWallpaper::setupFramebuffers: the scene colour target with the depth 3D scenes test against
     setupFramebuffers() {
       const w = this.width, h = this.height;
       const clamp = G.WEFBO.FLAG.CLAMP_UVS;
-      this.fbo = this.fbos.create('_rt_FullFrameBuffer', 'rgba8888', clamp, [w, h], [w, h]);
-      this.fbos.alias('_rt_MipMappedFrameBuffer', '_rt_FullFrameBuffer');
-      this.fbos.create('_rt_shadowAtlas', 'rgba8888', clamp, [w, h], [w, h]);
-      this.fbos.alias('_alias_lightCookie', '_rt_shadowAtlas');
+      this.fbo = this.fbos.create('_rt_FullFrameBuffer', this.colorFormat, clamp, [w, h], [w, h], { depth: true });
+      this.mipMappedFBO = this.fbos.create('_rt_MipMappedFrameBuffer', this.colorFormat, clamp, [w, h], [w, h], { mipmaps: true });
+      this.mipMappedStamp = -1;
+      this.frameCopyFBO = this.fbos.create('_rt_FullFrameBufferCopy', this.colorFormat, clamp, [w, h], [w, h]);
+    }
+
+    // A fresh copy of the frame for passes that read the frame buffer while drawing into it
+    frameCopy() {
+      this.frameCopyFBO.copyFrom(this.fbo);
+      return this.frameCopyFBO;
+    }
+
+    // The frame so far with a mip chain, which reflections sample by roughness, copied once a frame
+    refreshMipMappedFrameBuffer() {
+      if (this.mipMappedStamp === this.time) return;
+      this.mipMappedStamp = this.time;
+      this.mipMappedFBO.copyFrom(this.fbo);
+      this.gl.bindFramebuffer(this.gl.FRAMEBUFFER, this.fbo.framebuffer);
+    }
+
+    // Combos every material pass compiles with, from the scene's lights, HDR and projection
+    engineCombos() {
+      return Object.assign({ SCENE_ORTHO: this.is3D ? 0 : 1, HDR: this.hdr ? 1 : 0 }, this.lights ? this.lights.combos() : {});
     }
 
     // CScene::createObject: dependencies and the parent are created first.
@@ -277,6 +323,16 @@
 
     // CScene constructor: the bloom image (id -1) that reads the scene, blurs it and combines.
     async ensureBloom() {
+      if (this.hdr) {
+        if (this.hdrBloom || this.bloomLoading) return this.bloomLoading;
+        this.bloomLoading = (async () => {
+          const bloom = new G.WEHdrBloom.HdrBloom(this);
+          await bloom.setup();
+          this.hdrBloom = bloom;
+          this.bloomLoading = null;
+        })();
+        return this.bloomLoading;
+      }
       if (this.bloomObject || this.bloomLoading) return this.bloomLoading;
       const w = this.width, h = this.height;
       const constants = {
@@ -325,9 +381,8 @@
         uTexture: gl.getUniformLocation(program, 'g_Texture0'),
         uFade: gl.getUniformLocation(program, 'u_Fade'),
         texcoords: new Float32Array(12),
+        positions: new Float32Array(18),
       };
-      gl.bindBuffer(gl.ARRAY_BUFFER, this.present.position);
-      gl.bufferData(gl.ARRAY_BUFFER, PRESENT_POSITION, gl.STATIC_DRAW);
     }
 
     // ---- host integration -----------------------------------------------------------------------
@@ -336,6 +391,7 @@
         applyUserProperties: (props) => { try { this.properties.apply(props); } catch (e) { this.fail(e); } },
         applyGeneralProperties: (general) => {
           if (general && typeof general.fps === 'number') this.fpsLimit = general.fps;
+          if (general && typeof general.fit === 'string') { try { this.viewport.setFit(general.fit); } catch (e) { this.fail(e); return; } }
           if (general && typeof general === 'object') Object.assign(this.generalSettings, general);
           for (const fn of generalHooks) fn(general || {});
         },
@@ -414,18 +470,16 @@
       this.schedule();
     }
 
-    updateLights() {
-      const l = this.lights;
-      l.positions.fill(0); l.colors.fill(0); l.radii.fill(0);
-      let n = 0;
-      for (const object of this.renderOrder) {
-        if (!(object instanceof G.WEObjects.Light) || !object.visible.getBool() || n >= LIGHT_SLOTS) continue;
-        const p = object.worldPosition(), c = object.premultipliedColor();
-        l.positions[3 * n] = p[0]; l.positions[3 * n + 1] = p[1]; l.positions[3 * n + 2] = p[2];
-        l.colors[3 * n] = c[0]; l.colors[3 * n + 1] = c[1]; l.colors[3 * n + 2] = c[2];
-        l.radii[n] = object.radius.getNumber();
-        n++;
+    // 3D scenes draw solid objects first and sort the rest back to front when asked to
+    renderList() {
+      if (!this.is3D) return this.renderOrder;
+      const solids = [], others = [];
+      for (const object of this.renderOrder) (object.isSolid() ? solids : others).push(object);
+      if (this.transparentSorting) {
+        const depths = new Map(others.map((o) => [o, o.viewDepth()]));
+        others.sort((a, b) => depths.get(b) - depths.get(a));
       }
+      return solids.concat(others);
     }
 
     resizeCanvas() {
@@ -453,39 +507,53 @@
       this.textures.update();
       for (const object of this.renderOrder) object.update(this.dt);
       if (this.bloomObject) this.bloomObject.update(this.dt);
-      this.updateLights();
+      this.lights.update();
+      this.lights.renderShadows();
       gl.bindFramebuffer(gl.FRAMEBUFFER, this.fbo.framebuffer);
       gl.viewport(0, 0, this.fbo.realWidth, this.fbo.realHeight);
       gl.disable(gl.SCISSOR_TEST);
       gl.colorMask(true, true, true, true);
       gl.depthMask(true);
+      gl.clearDepth(1);
       const clear = this.colors.clear.getVec(3);
       gl.clearColor(clear[0], clear[1], clear[2], 1);
       gl.clear(this.clearEnabled ? gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT : gl.DEPTH_BUFFER_BIT);
-      for (const object of this.renderOrder) object.render();
-      if (this.bloomObject && this.bloom.enabled.getBool()) this.bloomObject.render();
-      this.presentFrame();
+      for (const object of this.renderList()) object.render();
+      this.lights.renderVolumetrics();
+      let source = this.fbo;
+      if (this.bloom.enabled.getBool()) {
+        if (this.hdrBloom) source = this.hdrBloom.render();
+        else if (this.bloomObject) this.bloomObject.render();
+      }
+      this.presentFrame(source);
     }
 
-    // CWallpaper::render: the scene texture onto the canvas with the fit mapping and fade.
-    presentFrame() {
-      const gl = this.gl, p = this.present, uvs = this.viewport.uvs;
+    // CWallpaper::render: the scene texture onto the canvas with the fit mapping and fade. The
+    // scene framebuffer holds its top row at v = 0, so the quad's top samples vstart.
+    presentFrame(source) {
+      const gl = this.gl, p = this.present, uvs = this.viewport.uvs, r = this.viewport.rect;
       p.texcoords.set([uvs.ustart, uvs.vstart, uvs.uend, uvs.vstart, uvs.ustart, uvs.vend, uvs.ustart, uvs.vend, uvs.uend, uvs.vstart, uvs.uend, uvs.vend]);
+      p.positions.set([r.x0, r.y1, 0, r.x1, r.y1, 0, r.x0, r.y0, 0, r.x0, r.y0, 0, r.x1, r.y1, 0, r.x1, r.y0, 0]);
       gl.bindFramebuffer(gl.FRAMEBUFFER, null);
       gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+      gl.disable(gl.SCISSOR_TEST);
+      gl.colorMask(true, true, true, true);
+      gl.clearColor(0, 0, 0, 1);
+      gl.clear(gl.COLOR_BUFFER_BIT);
       gl.bindVertexArray(p.vao);
       gl.disable(gl.BLEND);
       gl.disable(gl.DEPTH_TEST);
       gl.disable(gl.CULL_FACE);
       gl.useProgram(p.program);
       gl.activeTexture(gl.TEXTURE0);
-      gl.bindTexture(gl.TEXTURE_2D, this.fbo.textureId(0));
+      gl.bindTexture(gl.TEXTURE_2D, source.textureId(0));
       gl.enableVertexAttribArray(p.aTexCoord);
       gl.bindBuffer(gl.ARRAY_BUFFER, p.texcoord);
       gl.bufferData(gl.ARRAY_BUFFER, p.texcoords, gl.DYNAMIC_DRAW);
       gl.vertexAttribPointer(p.aTexCoord, 2, gl.FLOAT, false, 0, 0);
       gl.enableVertexAttribArray(p.aPosition);
       gl.bindBuffer(gl.ARRAY_BUFFER, p.position);
+      gl.bufferData(gl.ARRAY_BUFFER, p.positions, gl.DYNAMIC_DRAW);
       gl.vertexAttribPointer(p.aPosition, 3, gl.FLOAT, false, 0, 0);
       gl.uniform1i(p.uTexture, 0);
       gl.uniform1f(p.uFade, this.fade.factor(this.time));
@@ -513,7 +581,7 @@
   }
 
   const api = {
-    Scene, start, parseSceneData, autoProjectionSize, showError, LIGHT_SLOTS, BLOOM_ID,
+    Scene, start, parseSceneData, autoProjectionSize, showError, BLOOM_ID,
     registerObject: (key, ctor, priority) => G.WEObjects.register(key, ctor, priority),
     onLoad: (fn) => { loadHooks.push(fn); if (api.current && api.current.loaded) Promise.resolve().then(() => fn(api.current)).catch((e) => api.current.fail(e)); },
     onGeneralSettings: (fn) => { generalHooks.push(fn); },

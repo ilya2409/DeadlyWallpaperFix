@@ -1,8 +1,8 @@
 // Particle layers: scene.json objects carrying a "particle" definition (a file under particles/
 // or inline JSON) with "instanceoverride" multipliers. WEParticles.System simulates them; this
 // module owns the material, the render pass with Wallpaper Engine's particle shaders and the
-// sprite / rope vertex streams, for the root system and every static child system its
-// definition lists. Ports Render/Objects/CParticle.cpp (setup, setupPass, setupGeometryCallbacks,
+// sprite / rope vertex streams, for the root system and every child system its definition
+// lists. Ports Render/Objects/CParticle.cpp (setup, setupPass, setupGeometryCallbacks,
 // setupParticleUniforms, update, render, renderSprites, renderRope) and
 // ObjectParser::parseParticleChild.
 (() => {
@@ -14,6 +14,7 @@
   const DT_CAP = 0.1;
   const PREWARM_STEP = 1 / 30;
   const MAX_CHILD_DEPTH = 8;
+  const MAX_EVENT_UNITS = 32;
   const CONTROL_POINTS = 8;
   const UP = new Float32Array([0, 1, 0]);
   const RIGHT = new Float32Array([1, 0, 0]);
@@ -44,7 +45,7 @@
 
   /**
    * One particle system with its material, render pass and vertex streams: the layer's root
-   * system or a static child of it. It is the renderable its pass reads (scene, id, texture,
+   * system or a child of it. It is the renderable its pass reads (scene, id, texture,
    * colour accessors, passUniforms). `transform()` yields the system's scene-space transform.
    */
   class Unit {
@@ -74,6 +75,7 @@
       this.mats = null;
       this.vars = { var0: new Float32Array(4), var1: new Float32Array([0, 0, 0, 1]) };
       this.children = [];
+      this.eventPools = [];
     }
 
     // CRenderable::detectTexture for particles: the material's first texture slot, else the
@@ -108,6 +110,7 @@
         angles: { getVec: () => this.transform().angles },
         sceneWidth: this.scene.width,
         sceneHeight: this.scene.height,
+        is3D: this.scene.is3D,
         audio: () => this.owner.audio(),
         spritesheet,
       });
@@ -119,13 +122,16 @@
 
     // ObjectParser::parseParticleChild: static children are whole systems of their own, created
     // with the parent when their probability draw passes, placed by origin/angles/scale relative
-    // to the parent, with the definition's maxcount replaced when the child names one.
+    // to the parent, with the definition's maxcount replaced when the child names one. Event
+    // follow children run one system per live parent particle, riding along with it; event
+    // spawn children run one system per parent particle birth, left where it appeared.
     async setupChildren(depth) {
       for (const child of this.def.children) {
         const where = this.where + ' child "' + (child.name || child.particle) + '"';
-        if (child.type !== 'static') throw new Error(where + ': child particle type "' + child.type + '" has no reference behaviour this renderer can follow (static children are drawn)');
+        if (child.type !== 'static' && child.type !== 'eventfollow' && child.type !== 'eventspawn') throw new Error(where + ': child particle type "' + child.type + '" is neither static, eventfollow nor eventspawn');
         if (!child.particle) throw new Error(where + ' names no particle definition file');
         if (depth >= MAX_CHILD_DEPTH) throw new Error(where + ': child particle systems nest deeper than ' + MAX_CHILD_DEPTH + ' levels');
+        if (child.type !== 'static') { await this.setupEventPool(child, where, depth); continue; }
         if (!(Math.random() < child.probability)) continue;
         let json = await this.scene.loader.json(child.particle);
         if (!json || typeof json !== 'object') throw new Error(where + ': ' + child.particle + ' is not a particle definition');
@@ -133,6 +139,78 @@
         const unit = new Unit(this.owner, child.particle, json, where, () => composeTransform(this.transform(), child), this, child);
         await unit.setup(depth + 1);
         this.children.push(unit);
+      }
+    }
+
+    // A pool of child systems for an event child, each started by a parent particle
+    async setupEventPool(child, where, depth) {
+      const json = await this.scene.loader.json(child.particle);
+      if (!json || typeof json !== 'object') throw new Error(where + ': ' + child.particle + ' is not a particle definition');
+      const count = Math.max(1, Math.min(MAX_EVENT_UNITS, child.maxCount !== null ? child.maxCount : this.system.maxParticles));
+      const pool = [];
+      for (let i = 0; i < count; i++) {
+        const unit = new Unit(this.owner, child.particle, json, where + ' ' + child.type + ' ' + i, () => composeTransform(this.transform(), child), this, child);
+        await unit.setup(depth + 1);
+        unit.system.worldOrigin = [0, 0, 0];
+        unit.system.reset();
+        unit.system.pause();
+        pool.push(unit);
+      }
+      // A spawned system whose emitters never stop keeps its unit where it was born
+      const continuous = pool[0].def.emitters.some((e) => e.rate > 0 && !(e.duration > 0));
+      this.eventPools.push({ child, pool, follow: child.type === 'eventfollow', continuous, assigned: new Map(), busy: new Set(), skipped: new WeakSet() });
+    }
+
+    updateEventPools(dt, time, mouse) {
+      const toWorld = this.system.modelMatrix(null);
+      for (const pool of this.eventPools) {
+        if (pool.follow) this.updateFollowers(pool, toWorld, dt, time, mouse);
+        else this.updateSpawned(pool, toWorld, dt, time, mouse);
+      }
+    }
+
+    // Followers attach to parent particles as they are born and let go when they die
+    updateFollowers({ child, pool, assigned, skipped }, toWorld, dt, time, mouse) {
+      for (const [p, unit] of assigned) {
+        if (p.alive) continue;
+        unit.system.pause();
+        assigned.delete(p);
+      }
+      const busy = new Set(assigned.values());
+      for (const p of this.system.particles) {
+        if (!p.alive || assigned.has(p) || skipped.has(p)) continue;
+        if (!(Math.random() < child.probability)) { skipped.add(p); continue; }
+        const unit = pool.find((u) => !busy.has(u) && u.system.count === 0);
+        if (!unit) break;
+        unit.system.reset();
+        unit.system.play();
+        assigned.set(p, unit);
+        busy.add(unit);
+      }
+      for (const [p, unit] of assigned) {
+        const world = M.transformPoint(toWorld, p.position);
+        unit.system.worldOrigin = world;
+      }
+      for (const unit of pool) {
+        if (!busy.has(unit) && unit.system.count === 0) continue;
+        unit.update(dt, time, mouse);
+      }
+    }
+
+    // Spawned systems start where a parent particle is born and run their course there
+    updateSpawned({ child, pool, busy, continuous }, toWorld, dt, time, mouse) {
+      for (const p of this.system.born) {
+        if (!(Math.random() < child.probability)) continue;
+        const unit = pool.find((u) => !busy.has(u));
+        if (!unit) break;
+        unit.system.worldOrigin = M.transformPoint(toWorld, p.position);
+        unit.system.reset();
+        unit.system.play();
+        busy.add(unit);
+      }
+      for (const unit of busy) {
+        unit.update(dt, time, mouse);
+        if (!continuous && unit.system.count === 0) busy.delete(unit);
       }
     }
 
@@ -198,8 +276,8 @@
         g_OrientationUp: () => UP,
         g_OrientationRight: () => RIGHT,
         g_OrientationForward: () => FORWARD,
-        g_ViewUp: () => UP,
-        g_ViewRight: () => RIGHT,
+        g_ViewUp: () => (this.scene.is3D ? this.scene.camera.upVector : UP),
+        g_ViewRight: () => (this.scene.is3D ? this.scene.camera.right : RIGHT),
         g_EyePosition: () => this.mats.eye,
         g_RenderVar0: () => this.vars.var0,
         g_RenderVar1: () => this.vars.var1,
@@ -227,6 +305,7 @@
         child.mirrorControlPoints();
         child.update(dt, time, mouse);
       }
+      this.updateEventPools(dt, time, mouse);
     }
 
     // CParticle::render -> renderSprites / renderRope, then the children right after.
@@ -256,6 +335,7 @@
         pass.render();
       }
       for (const child of this.children) child.render(parallaxOffset);
+      for (const { pool } of this.eventPools) for (const unit of pool) if (unit.system.count > 0) unit.render(parallaxOffset);
     }
 
     // REFRACT shaders read the scene while the pass writes to it: they get a copy taken now.
@@ -270,12 +350,14 @@
     setPaused(paused) {
       if (this.texture) this.texture.setPaused(paused);
       for (const child of this.children) child.setPaused(paused);
+      for (const { pool } of this.eventPools) for (const unit of pool) unit.setPaused(paused);
     }
 
     // Every definition in this tree (the scripts and bindings inside them are found through it).
     definitions(out) {
       out.push(this.def);
       for (const child of this.children) child.definitions(out);
+      for (const { pool } of this.eventPools) if (pool.length) pool[0].definitions(out);
       return out;
     }
 
@@ -291,7 +373,9 @@
     dispose() {
       const gl = this.scene.gl;
       for (const child of this.children) child.dispose();
+      for (const { pool } of this.eventPools) for (const unit of pool) unit.dispose();
       this.children = [];
+      this.eventPools = [];
       if (this.pass) this.pass.dispose();
       if (this.vao) gl.deleteVertexArray(this.vao);
       if (this.vbo) gl.deleteBuffer(this.vbo);
@@ -371,7 +455,7 @@
     // CParticle::applyParallaxToModelMatrix: depths below the minimum are pushed out to it.
     parallaxOffset() {
       const scene = this.scene;
-      if (!scene.parallax.enabled.getBool()) return null;
+      if (scene.is3D || !scene.parallax.enabled.getBool()) return null;
       const amount = scene.parallax.amount.getNumber();
       const depth = this.parallaxDepth.getVec(2).slice(0, 2);
       for (let i = 0; i < 2; i++) if (Math.abs(depth[i]) < MINIMUM_PARTICLE_DEPTH) depth[i] = depth[i] < 0 ? -MINIMUM_PARTICLE_DEPTH : MINIMUM_PARTICLE_DEPTH;
@@ -381,13 +465,13 @@
 
     // CParticle::update, with the frame time capped as the reference does; children share the clock.
     update(dt) {
-      if (!this.initialized || !this.visible.getBool()) return;
+      if (!this.initialized || !this.shown()) return;
       const step = Math.min(Math.max(dt, 0), DT_CAP);
       this.root.update(step, this.scene.time, this.scene.mouse.position);
     }
 
     render() {
-      if (!this.initialized || !this.visible.getBool()) return;
+      if (!this.initialized || !this.shown()) return;
       this.root.render(this.parallaxOffset());
     }
 

@@ -426,10 +426,10 @@ impl Engine {
         })
     }
 
-    /// What an instance shows: its display's part of the spanning image, or all of its region.
+    /// What an instance shows: its display's view of the image, or all of its region.
     fn view_of(&self, p: &Placement, d: &Display) -> View {
-        if p.spanning {
-            self.layout.view_for(d, Layout::span_bounds(&self.displays))
+        if p.aligned {
+            self.layout.view_for(d, &self.displays)
         } else {
             View::whole(Size {
                 w: p.region.w,
@@ -464,24 +464,17 @@ impl Engine {
         }
     }
 
-    /// Whether the span wallpaper can show `layout`'s views on this desktop.
+    /// Whether every display's wallpaper can show `layout`'s views on this desktop.
     fn check_alignment(&self, layout: &Layout) -> Result<()> {
-        if layout.arrangement != Arrangement::Span {
-            return Err(Error::Invalid(
-                "alignment applies to the span arrangement".into(),
-            ));
-        }
-        let Some(kind) = layout
-            .shared
-            .as_deref()
-            .and_then(|id| self.library.get(id).ok())
-            .map(|w| w.kind())
-        else {
-            return Ok(());
-        };
-        let bounds = Layout::span_bounds(&self.displays);
         for d in &self.displays {
-            let v = layout.view_for(d, bounds);
+            let Some(kind) = layout
+                .wallpaper_for(&d.id)
+                .and_then(|id| self.library.get(id).ok())
+                .map(|w| w.kind())
+            else {
+                continue;
+            };
+            let v = layout.view_for(d, &self.displays);
             if kind == Kind::Program && !v.is_plain() {
                 return Err(Error::Unsupported(
                     "program wallpapers can be moved but not scaled or rotated".into(),
@@ -996,9 +989,12 @@ impl Engine {
                 self.reconcile();
                 Response::Ok
             }
-            Request::AlignImage { pose } => self
-                .align(|l| l.set_image_pose(pose))
-                .map_or_else(|e| Response::error(&e), |_| Response::Ok),
+            Request::AlignImage { display, pose } => match self.display(display.as_deref()) {
+                Ok(d) => self
+                    .align(|l| l.set_image_pose(&d.id, pose))
+                    .map_or_else(|e| Response::error(&e), |_| Response::Ok),
+                Err(e) => Response::error(&e),
+            },
             Request::AlignDisplay { display, pose } => match self.display(Some(&display)) {
                 Ok(d) => self
                     .align(|l| l.set_display_pose(&d.id, pose))

@@ -13,21 +13,6 @@
 
   const ATTRIBUTES = { position: 'a_Position', texcoord: 'a_TexCoord', indices: 'a_BlendIndices', weights: 'a_BlendWeights' };
 
-  // uv = s * position + t along one axis, from the mesh's extreme vertices (puppet meshes are
-  // the image plane triangulated, so their texture coordinates are affine in position).
-  function fitAxis(positions, uvs, count, axis, name) {
-    let imin = 0, imax = 0;
-    for (let i = 1; i < count; i++) {
-      if (positions[i * 3 + axis] < positions[imin * 3 + axis]) imin = i;
-      if (positions[i * 3 + axis] > positions[imax * 3 + axis]) imax = i;
-    }
-    const p0 = positions[imin * 3 + axis], p1 = positions[imax * 3 + axis];
-    const u0 = uvs[imin * 2 + axis], u1 = uvs[imax * 2 + axis];
-    if (p1 - p0 < 1e-6) throw new Error(name + ': the puppet mesh is flat along axis ' + axis + ', so it cannot map onto the layer');
-    const s = (u1 - u0) / (p1 - p0);
-    return [s, u0 - s * p0];
-  }
-
   function parseLayerSpec(json, where, properties, defaults) {
     if (!json || typeof json !== 'object') throw new Error(where + ' is not an object');
     const setting = (key, kind, dflt, expectColor) => G.WEProps.setting(json[key], { kind, default: dflt, expectColor: !!expectColor, where: where + '.' + key, properties });
@@ -74,8 +59,12 @@
       this.vaos = new WeakMap();
       this.indexCount = 0;
       this.vertexCount = 0;
-      // uv = fit.s * position + fit.t per axis; `map` places the mesh in copy space (0..size),
+      // Mesh positions are pixels of the image the puppet was built on, centred, y up. The box
+      // is the rectangle the layer's buffers cover in layer pixels; fit.s * position + fit.t is
+      // the position inside it per axis, `map` places the mesh in copy space (0..size),
       // `sceneMap` on the layer's quad in scene space for a pass that draws to the scene.
+      this.bounds = null;
+      this.box = null;
       this.fit = null;
       this.map = M.identity();
       this.sceneMap = M.identity();
@@ -104,9 +93,17 @@
       this.meshUvs = new Float32Array(total * 2);
       const indices = new Uint32Array(total * 4), weights = new Float32Array(total * 4), elements = new Uint32Array(indexTotal);
       let v = 0, e = 0;
+      const bounds = { minX: Infinity, maxX: -Infinity, minY: Infinity, maxY: -Infinity };
       for (const m of meshes) {
         this.meshPositions.set(m.positions, v * 3);
         this.meshUvs.set(m.uvs, v * 2);
+        for (let i = 0; i < m.count; i++) {
+          const x = m.positions[i * 3], y = m.positions[i * 3 + 1];
+          if (x < bounds.minX) bounds.minX = x;
+          if (x > bounds.maxX) bounds.maxX = x;
+          if (y < bounds.minY) bounds.minY = y;
+          if (y > bounds.maxY) bounds.maxY = y;
+        }
         indices.set(m.blendIndices, v * 4);
         if (m.blendWeights) weights.set(m.blendWeights, v * 4);
         else for (let i = 0; i < m.count; i++) weights[(v + i) * 4] = 1;
@@ -116,6 +113,8 @@
       }
       const boneCount = this.instance.puppet.bones.length;
       for (let i = 0; i < indices.length; i++) if (weights[i] > 0 && indices[i] >= boneCount) throw new Error(this.name + ': vertex ' + (i >> 2) + ' is bound to bone ' + indices[i] + ' of ' + boneCount);
+      if (!(bounds.maxX > bounds.minX && bounds.maxY > bounds.minY)) throw new Error(this.name + ': the puppet mesh is flat, so it cannot map onto the layer');
+      this.bounds = bounds;
       this.blendIndices = indices;
       this.blendWeights = weights;
       gl.bindBuffer(gl.ARRAY_BUFFER, this.buffers.indices);
@@ -163,14 +162,28 @@
 
     drawsToScene(pass) { return pass.positionBuffer === this.image.buffers.sceneSpace; }
 
-    // The mesh -> copy-space map: mesh uv spans the image, copy space spans the layer size.
+    // The rectangle the layer's buffers cover, in layer pixels centred on the layer: the layer's
+    // own rectangle grown to hold the mesh at rest with a sixteenth of the mesh's extent to move in
+    layerBox(layerSize) {
+      const tex = this.image.texture;
+      if (!tex) throw new Error(this.name + ': the puppet has no texture to size its mesh by');
+      const kx = layerSize[0] / tex.realWidth, ky = layerSize[1] / tex.realHeight;
+      const b = this.bounds;
+      const padX = (b.maxX - b.minX) * kx / 16, padY = (b.maxY - b.minY) * ky / 16;
+      const x0 = Math.min(-layerSize[0] / 2, b.minX * kx - padX), x1 = Math.max(layerSize[0] / 2, b.maxX * kx + padX);
+      const y0 = Math.min(-layerSize[1] / 2, b.minY * ky - padY), y1 = Math.max(layerSize[1] / 2, b.maxY * ky + padY);
+      this.box = { kx, ky, x0, y0, x1, y1 };
+      return { size: [x1 - x0, y1 - y0], center: [(x0 + x1) / 2, (y0 + y1) / 2] };
+    }
+
+    // The mesh -> copy-space map over the layer box, whose top row lands at copy y = 0.
     resize(size) {
       const gl = this.gl;
       this.size = [size[0], size[1]];
       const n = this.vertexCount;
-      const [sx, tx] = fitAxis(this.meshPositions, this.meshUvs, n, 0, this.name);
-      const [sy, ty] = fitAxis(this.meshPositions, this.meshUvs, n, 1, this.name);
-      this.fit = { sx, tx, sy, ty };
+      const box = this.box;
+      if (!box) throw new Error(this.name + ': the layer box is not known yet, so the mesh cannot be placed');
+      this.fit = { sx: box.kx / size[0], tx: -box.x0 / size[0], sy: -box.ky / size[1], ty: box.y1 / size[1] };
       this.map = this.mapFor(0, size[0], 0, size[1]);
       this.uploadPositions(this.buffers.position, this.map);
       this.scenePos = null;
@@ -178,7 +191,7 @@
       // Texture coordinates follow the layer's copy quad: padded textures cover only part of it.
       const tex = this.image.texture;
       let width = 1, height = 1;
-      if (tex && !tex.animated && (tex.textureWidth(0) !== tex.realWidth || tex.textureHeight(0) !== tex.realHeight)) {
+      if (!tex.animated && (tex.textureWidth(0) !== tex.realWidth || tex.textureHeight(0) !== tex.realHeight)) {
         width = tex.realWidth / tex.textureWidth(0);
         height = tex.realHeight / tex.textureHeight(0);
       }
@@ -257,6 +270,7 @@
     }
 
     // Bind the pass's VAO with the positions of the space it draws in (copy buffer or scene).
+    // The y flip of the mesh map turns the mesh's winding, so its front faces are clockwise.
     setup(pass) {
       const gl = this.gl;
       gl.bindVertexArray(this.vaoFor(pass));
@@ -265,9 +279,13 @@
       if (this.drawsToScene(pass)) { this.sceneMapFor(this.image.pos); buffer = this.buffers.scenePosition; }
       gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
       gl.vertexAttribPointer(info.location, 3, gl.FLOAT, false, 0, 0);
+      gl.frontFace(gl.CW);
     }
-    draw() { this.gl.drawElements(this.gl.TRIANGLES, this.indexCount, this.gl.UNSIGNED_INT, 0); }
-    cleanup(pass) { this.gl.bindVertexArray(pass.vao); }
+    draw(pass, instances) {
+      if (instances > 1) this.gl.drawElementsInstanced(this.gl.TRIANGLES, this.indexCount, this.gl.UNSIGNED_INT, 0, instances);
+      else this.gl.drawElements(this.gl.TRIANGLES, this.indexCount, this.gl.UNSIGNED_INT, 0);
+    }
+    cleanup(pass) { this.gl.frontFace(this.gl.CCW); this.gl.bindVertexArray(pass.vao); }
 
     dispose() {
       for (const b of Object.values(this.buffers)) this.gl.deleteBuffer(b);
@@ -303,12 +321,13 @@
       return index;
     }
 
-    // Attachment transform in layer space (pixels from the layer centre, y up, angle in radians).
+    // Attachment transform in layer space (pixels from the layer centre, y down, angle in radians).
     attachmentTransform(ref) {
       const index = this.attachmentIndex(ref);
-      const world = M.multiply(this.geometry.map, this.instance.attachmentWorld(index));
-      const size = this.geometry.size;
-      return { origin: [world[12] - size[0] / 2, world[13] - size[1] / 2, world[14]], angle: Math.atan2(world[1], world[0]), matrix: world };
+      const world = this.instance.attachmentWorld(index);
+      const box = this.geometry.box;
+      if (!box) throw new Error('puppet ' + this.image.model.puppet + ' is not laid out yet, so attachment ' + JSON.stringify(ref) + ' has no place');
+      return { origin: [world[12] * box.kx, -world[13] * box.ky, world[14]], angle: -Math.atan2(world[1], world[0]) };
     }
 
     findLayer(ref) {
@@ -371,7 +390,7 @@
     image.setFirstPassGeometry({
       positionBuffer: geometry.positionBuffer,
       setup: (pass) => geometry.setup(pass),
-      draw: (pass) => geometry.draw(pass),
+      draw: (pass, instances) => geometry.draw(pass, instances),
       cleanup: (pass) => geometry.cleanup(pass),
       resize: (size) => geometry.resize(size),
     });
@@ -381,7 +400,7 @@
 
   G.WEImage.modelHooks.push(attach);
 
-  const api = { attach, PuppetWarp, PuppetGeometry, fitAxis, layerSpecs, parseLayerSpec, ATTRIBUTES };
+  const api = { attach, PuppetWarp, PuppetGeometry, layerSpecs, parseLayerSpec, ATTRIBUTES };
   G.WEPuppetWarp = api;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
 })();

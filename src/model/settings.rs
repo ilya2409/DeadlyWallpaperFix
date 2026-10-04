@@ -154,6 +154,16 @@ impl Scaler {
         Scaler::ALL[(i.clamp(0, 3)) as usize]
     }
 
+    /// The fit as the Plasma plugin and the scene page name it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Scaler::None => "none",
+            Scaler::Fill => "fill",
+            Scaler::Uniform => "uniform",
+            Scaler::UniformFill => "uniformfill",
+        }
+    }
+
     /// libmpv property assignments realizing this fit.
     pub fn mpv_properties(self) -> &'static [(&'static str, &'static str)] {
         match self {

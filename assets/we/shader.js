@@ -6,42 +6,16 @@
 
   const VERTEX = 0, FRAGMENT = 1;
 
-  // Overloads that accept HLSL's argument orders; declared before the macros that route to them.
-  const OVERLOADS = (() => {
-    const out = [];
-    const vec = ['vec2', 'vec3', 'vec4'];
-    const ivec = ['ivec2', 'ivec3', 'ivec4'];
-    for (const fn of ['max', 'min']) {
-      const w = '_we' + fn;
-      out.push(`float ${w}(float a, float b) { return ${fn}(a, b); }`);
-      out.push(`int ${w}(int a, int b) { return ${fn}(a, b); }`);
-      for (const t of vec) {
-        out.push(`${t} ${w}(${t} a, ${t} b) { return ${fn}(a, b); }`);
-        out.push(`${t} ${w}(${t} a, float b) { return ${fn}(a, b); }`);
-        out.push(`${t} ${w}(float a, ${t} b) { return ${fn}(b, a); }`);
-      }
-      for (const t of ivec) {
-        out.push(`${t} ${w}(${t} a, ${t} b) { return ${fn}(a, b); }`);
-        out.push(`${t} ${w}(${t} a, int b) { return ${fn}(a, b); }`);
-        out.push(`${t} ${w}(int a, ${t} b) { return ${fn}(b, a); }`);
-      }
-    }
-    out.push('float _wepow(float a, float b) { return pow(a, b); }');
-    for (const t of vec) {
-      out.push(`${t} _wepow(${t} a, ${t} b) { return pow(a, b); }`);
-      out.push(`${t} _wepow(${t} a, float b) { return pow(a, ${t}(b)); }`);
-      out.push(`${t} _wepow(float a, ${t} b) { return pow(${t}(a), b); }`);
-    }
-    // Texture slots flagged ClampUVsBorder sample transparent black outside [0, 1] (GL_CLAMP_TO_BORDER
-    // with the default border colour); WebGL2 has no border mode, so flagged slots are routed here.
-    out.push('uniform int g_WEBorderMask;');
-    out.push('bool _weOutside(int slot, vec2 uv) { return (g_WEBorderMask & (1 << slot)) != 0 && (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0); }');
-    out.push('vec4 _weSampleBorder(sampler2D s, int slot, vec2 uv) { if (_weOutside(slot, uv)) return vec4(0.0); return texture(s, uv); }');
-    out.push('vec4 _weSampleBorderLod(sampler2D s, int slot, vec2 uv, float lod) { if (_weOutside(slot, uv)) return vec4(0.0); return textureLod(s, uv, lod); }');
-    return out.join('\n') + '\n';
-  })();
+  // Texture slots flagged ClampUVsBorder sample transparent black outside the unit square through these
+  const BORDER_HELPERS = [
+    'uniform int g_WEBorderMask;',
+    'bool _weOutside(int slot, vec2 uv) { return (g_WEBorderMask & (1 << slot)) != 0 && (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0); }',
+    'vec4 _weSampleBorder(sampler2D s, int slot, vec2 uv) { if (_weOutside(slot, uv)) return vec4(0.0); return texture(s, uv); }',
+    'vec4 _weSampleBorderLod(sampler2D s, int slot, vec2 uv, float lod) { if (_weOutside(slot, uv)) return vec4(0.0); return textureLod(s, uv, lod); }',
+    '',
+  ].join('\n');
 
-  // Route material texture samples through the border-aware samplers (see OVERLOADS).
+  // Routes material texture samples through the border aware samplers
   function routeBorderSamples(body) {
     return body
       .replace(/\b(?:texSample2DLod|texture2DLod|textureLod)\s*\(\s*(g_Texture([0-7]))\s*,/g, '_weSampleBorderLod($1, $2,')
@@ -76,11 +50,15 @@
     '#define fmod(x, y) ((x)-(y)*trunc((x)/(y)))',
     '#define ddx dFdx',
     '#define ddy(x) dFdy(-(x))',
-    '#define max _wemax',
-    '#define min _wemin',
-    '#define pow _wepow',
+    '#define CASTF(x) (float(x))',
+    '#define CASTU(x) (uint(x))',
+    '#define CASTI(x) (int(x))',
+    '#define sampler2DBackBuffer sampler2D',
+    '#define sampler2DComparison sampler2DShadow',
+    '#define texSample2DCompare(s, uv, depth) texture(s, vec3(uv, depth))',
+    '#define DECLARE_SAMPLER2D_PARAMETER(name) sampler2D name',
+    '#define MAKE_SAMPLER2D_ARGUMENT(name) name',
     '#define GLSL 1',
-    '#define HLSL 0',
     '',
   ].join('\n');
 
@@ -89,11 +67,30 @@
     + 'vec4 _weSampleBorder(sampler2D s, int slot, vec2 uv, float bias) { if (_weOutside(slot, uv)) return vec4(0.0); return texture(s, uv, bias); }\n';
   const VERTEX_DEFINES = '#define attribute in\n#define varying out\n';
 
+  // Name to type of every scalar or vector out a translated vertex shader declares
+  function vertexOutputs(source) {
+    const out = {};
+    const re = /^(?:(?:flat|smooth|centroid|invariant)\s+)*out\s+([A-Za-z_][A-Za-z0-9_]*)\s+([^;]+);$/gm;
+    let m;
+    while ((m = re.exec(source)) !== null) {
+      for (const d of m[2].split(',')) {
+        const name = d.trim();
+        if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) out[name] = m[1];
+      }
+    }
+    return out;
+  }
+
+  // Comments replaced by spaces of the same length so searches skip them and offsets still line up
+  function blankComments(text) {
+    return text.replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g, (c) => c.replace(/[^\n]/g, ' '));
+  }
+
   // "1 2 3" and numbers into the vector type a parameter declares.
   function parseVector(value, size) {
     let parts;
     if (typeof value === 'number') parts = [value];
-    else if (typeof value === 'string') parts = value.trim().split(/\s+/).filter((s) => s.length).map(Number);
+    else if (typeof value === 'string') parts = value.trim().split(/[\s,]+/).filter((s) => s.length).map(Number);
     else if (Array.isArray(value)) parts = value.map(Number);
     else throw new Error('cannot read a vector from ' + JSON.stringify(value));
     if (parts.some((n) => !Number.isFinite(n))) throw new Error('cannot read a vector from ' + JSON.stringify(value));
@@ -131,6 +128,7 @@
       this.discoveredCombos = {};
       this.usedCombos = {};
       this.defaultTextures = {};
+      this.formatCombos = {};
       this.link = null;
       this.preprocessed = '';
       this.includes = '';
@@ -196,7 +194,8 @@
     // Place gathered includes before main(), after the last declaration and outside any
     // preprocessor block that would hide them from other branches.
     insertIncludes() {
-      const src = this.preprocessed;
+      const original = this.preprocessed;
+      const src = blankComments(original);
       const mainRe = /(^|[\s;}])main\s*\(/g;
       let m;
       let mainAt = -1;
@@ -229,7 +228,7 @@
         const eol = src.lastIndexOf('\n', open);
         insertAt = eol < 0 ? 0 : eol;
       }
-      this.preprocessed = src.slice(0, insertAt) + '\n' + this.includes + '\n' + src.slice(insertAt);
+      this.preprocessed = original.slice(0, insertAt) + '\n' + this.includes + '\n' + original.slice(insertAt);
     }
 
     preprocessRequires() {
@@ -241,7 +240,7 @@
     }
 
     resolveRequire(name) {
-      if (name === 'LightingV1') return LIGHTING_V1;
+      if (name === 'LightingV1') return G.WELighting.MODULE;
       throw new Error('shader ' + this.file + ' requires module ' + name + ', which is not one Wallpaper Engine provides');
     }
 
@@ -290,13 +289,11 @@
       const material = data.material;
       const hasDefault = 'default' in data;
       const constant = material !== undefined ? this.constants[material] : undefined;
-      if (constant === undefined && !hasDefault && type !== 'sampler2D' && type !== 'sampler2DComparison') {
-        throw new Error('Cannot parse parameter data for ' + name + ' in shader ' + this.file + ': no default and no material value');
-      }
       let parameter = null;
       const arrayMatch = /^([A-Za-z_][A-Za-z0-9_]*)\[(\d+)\]$/.exec(name);
       const baseName = arrayMatch ? arrayMatch[1] : name;
-      const dflt = hasDefault ? data.default : (constant !== undefined ? constant : null);
+      // A material value missing from both shader and material reads as zero, like any unset uniform
+      const dflt = hasDefault ? data.default : (constant !== undefined ? constant : 0);
       switch (type) {
         case 'vec4': parameter = { type: 'vec4', value: parseVector(dflt, 4) }; break;
         case 'vec3': parameter = { type: 'vec3', value: parseVector(dflt, 3) }; break;
@@ -309,6 +306,7 @@
           const im = /g_Texture(\d+)/.exec(baseName);
           if (!im) return;
           const index = parseInt(im[1], 10);
+          if (data.formatcombo) this.formatCombos[index] = true;
           const combo = data.combo;
           if (typeof combo === 'string') {
             const slotUsed = (index in this.passTextures) || (index in this.overrideTextures);
@@ -372,30 +370,15 @@
       return source;
     }
 
-    applyFragmentTexCoordCompatibility(source) {
-      if (this.type !== FRAGMENT) return source;
-      const before = /\bv_TexCoord\b(\s*[-+*/]\s*CAST2\s*\()/g;
-      const after = /(CAST2\s*\([^)]+\)\s*[-+*/]\s*)\bv_TexCoord\b/g;
-      if (!/\bvarying\s+vec[34]\s+v_TexCoord\s*;/.test(source) || (!before.test(source) && !after.test(source))) return source;
-      return source.replace(before, 'v_TexCoord.xy$1').replace(after, '$1v_TexCoord.xy');
-    }
-
     compile() {
       if (this.final) return this.final;
-      let out = '#version 300 es\n';
-      out += '// ======================================================\n';
-      out += '// Processed shader ' + this.file + '\n';
-      out += '// ======================================================\n';
-      out += 'precision highp float;\nprecision highp int;\n';
-      out += OVERLOADS;
-      out += HEADER_DEFINES;
-      out += this.type === FRAGMENT ? FRAGMENT_DEFINES : VERTEX_DEFINES;
+      let defines = HEADER_DEFINES + (this.type === FRAGMENT ? FRAGMENT_DEFINES : VERTEX_DEFINES);
       const added = new Set();
       const define = (name, value) => {
         const upper = name.toUpperCase();
         if (added.has(upper)) return;
         added.add(upper);
-        out += '#define ' + upper + ' ' + value + '\n';
+        defines += '#define ' + upper + ' ' + value + '\n';
       };
       for (const [k, v] of Object.entries(this.overrideCombos)) define(k, v);
       for (const [k, v] of Object.entries(this.combos)) define(k, v);
@@ -404,102 +387,25 @@
         for (const [k, v] of Object.entries(this.link.combos)) define(k, v);
         for (const [k, v] of Object.entries(this.link.discoveredCombos)) define(k, v);
       }
-      const body = routeBorderSamples(this.applyFragmentTexCoordCompatibility(this.applyLinkedVaryingCompatibility(this.preprocessed)));
-      const resolved = resolveConditionMacros(out, body);
-      out += resolved.defines.map((name) => '#define ' + name + ' 0\n').join('');
-      out += resolved.body;
-      this.final = out;
-      return out;
-    }
-  }
-
-  const PREDEFINED_MACROS = new Set(['__VERSION__', '__LINE__', '__FILE__', 'GL_ES', 'defined']);
-  const DEFINED_CALL = /\bdefined[ \t]*\(?[ \t]*[A-Za-z_][A-Za-z0-9_]*[ \t]*\)?/;
-  const CONDITION_IDENTIFIER = /(^|[^A-Za-z0-9_.])([A-Za-z_][A-Za-z0-9_]*)/g;
-  function resolveConditionMacros(header, body) {
-    const defined = new Set(PREDEFINED_MACROS);
-    const defineRe = /^[ \t]*#[ \t]*define[ \t]+([A-Za-z_][A-Za-z0-9_]*)/gm;
-    let m;
-    for (const text of [header, body]) while ((m = defineRe.exec(text)) !== null) defined.add(m[1]);
-    const tested = new Set();
-    const ifdefRe = /^[ \t]*#[ \t]*(?:ifdef|ifndef)[ \t]+([A-Za-z_][A-Za-z0-9_]*)/gm;
-    while ((m = ifdefRe.exec(body)) !== null) tested.add(m[1]);
-    const definedRe = new RegExp(DEFINED_CALL.source.replace('[A-Za-z_][A-Za-z0-9_]*', '([A-Za-z_][A-Za-z0-9_]*)'), 'g');
-    while ((m = definedRe.exec(body)) !== null) tested.add(m[1]);
-    const defines = [];
-    const seen = new Set();
-    const splitter = new RegExp('(' + DEFINED_CALL.source + ')');
-    const condRe = /^([ \t]*#[ \t]*(?:if|elif)[ \t]+)([^\n]*)$/gm;
-    const rewritten = body.replace(condRe, (all, directive, rest) => {
-      const commentAt = rest.indexOf('//');
-      const expr = commentAt >= 0 ? rest.slice(0, commentAt) : rest;
-      const comment = commentAt >= 0 ? rest.slice(commentAt) : '';
-      // Odd pieces are defined(X) calls, whose X is neither collected nor replaced.
-      const pieces = expr.split(splitter);
-      for (let i = 0; i < pieces.length; i += 2) {
-        pieces[i] = pieces[i].replace(CONDITION_IDENTIFIER, (whole, before, name) => {
-          if (defined.has(name)) return whole;
-          if (tested.has(name)) return before + '0';
-          if (!seen.has(name)) { seen.add(name); defines.push(name); }
-          return whole;
-        });
+      const body = routeBorderSamples(this.applyLinkedVaryingCompatibility(this.preprocessed));
+      const input = BORDER_HELPERS + defines + body;
+      const stage = this.type === FRAGMENT ? 'fragment' : 'vertex';
+      const linkedOutputs = this.type === FRAGMENT && this.link ? vertexOutputs(this.link.compile()) : {};
+      let translated;
+      try {
+        translated = G.WEGLSL.translate(input, stage, { linkedOutputs });
+      } catch (e) {
+        if (!(e instanceof G.WEGLSL.TranslateError)) throw e;
+        throw new Error('shader ' + this.file + ' (' + stage + ') failed to translate: ' + e.message + '\nSource:\n' + numbered(input));
       }
-      return directive + pieces.join('') + comment;
-    });
-    return { defines, body: rewritten };
-  }
-
-  const LIGHTING_V1 = `// begin of generated module LightingV1
-#ifndef WE_LIGHT_COUNT
-#define WE_LIGHT_COUNT 4
-#endif
-uniform vec3 g_LightsPosition[WE_LIGHT_COUNT];
-uniform vec3 g_LightsColorPremultiplied[WE_LIGHT_COUNT];
-uniform float g_LightsRadius[WE_LIGHT_COUNT];
-uniform vec3 g_LightAmbientColor;
-uniform vec3 g_LightSkylightColor;
-float _weDistributionGGX(float NdotH, float roughness) {
-    float a = roughness * roughness;
-    float a2 = a * a;
-    float d = NdotH * NdotH * (a2 - 1.0) + 1.0;
-    return a2 / (3.14159265 * d * d + 0.0001);
-}
-float _weGeometrySchlick(float NdotV, float roughness) {
-    float k = (roughness + 1.0) * (roughness + 1.0) / 8.0;
-    return NdotV / (NdotV * (1.0 - k) + k + 0.0001);
-}
-vec3 PerformLighting_V1(vec3 worldPos, vec3 albedo, vec3 normal, vec3 viewDir,
-    vec3 specularTint, vec3 baseReflectance, float roughness, float metallic)
-{
-    vec3 N = normalize(normal);
-    vec3 V = normalize(viewDir);
-    vec3 F0 = mix(baseReflectance, albedo, metallic);
-    vec3 result = vec3(0.0);
-    for (int i = 0; i < WE_LIGHT_COUNT; i++) {
-        vec3 toLight = g_LightsPosition[i] - worldPos;
-        float dist = length(toLight);
-        if (g_LightsRadius[i] <= 0.0) continue;
-        vec3 L = toLight / (dist + 0.0001);
-        float attenuation = clamp(1.0 - (dist * dist) / (g_LightsRadius[i] * g_LightsRadius[i]), 0.0, 1.0);
-        attenuation *= attenuation;
-        vec3 radiance = g_LightsColorPremultiplied[i] * attenuation;
-        vec3 H = normalize(L + V);
-        float NdotL = clamp(dot(N, L), 0.0, 1.0);
-        float NdotV = clamp(dot(N, V), 0.0, 1.0);
-        float NdotH = clamp(dot(N, H), 0.0, 1.0);
-        float HdotV = clamp(dot(H, V), 0.0, 1.0);
-        vec3 F = F0 + (1.0 - F0) * pow(1.0 - HdotV, 5.0);
-        float D = _weDistributionGGX(NdotH, roughness);
-        float Gs = _weGeometrySchlick(NdotV, roughness) * _weGeometrySchlick(NdotL, roughness);
-        vec3 specular = (D * Gs * F) / (4.0 * NdotV * NdotL + 0.0001) * specularTint;
-        vec3 kD = (vec3(1.0) - F) * (1.0 - metallic);
-        result += (kD * albedo / 3.14159265 + specular) * radiance * NdotL;
+      this.final = '#version 300 es\n'
+        + '// ======================================================\n'
+        + '// Processed shader ' + this.file + ' (' + stage + ')\n'
+        + '// ======================================================\n'
+        + translated;
+      return this.final;
     }
-    result += albedo * mix(g_LightAmbientColor, g_LightSkylightColor, clamp(N.y * 0.5 + 0.5, 0.0, 1.0));
-    return result;
-}
-// end of generated module LightingV1
-`;
+  }
 
   /** A vertex + fragment pair with linked combos. */
   class Shader {
@@ -578,7 +484,7 @@ vec3 PerformLighting_V1(vec3 worldPos, vec3 albedo, vec3 normal, vec3 viewDir,
     return { program, uniforms, attributes };
   }
 
-  const api = { VERTEX, FRAGMENT, Unit, Shader, buildProgram, parseVector, parseScalar, OVERLOADS, HEADER_DEFINES, resolveConditionMacros, routeBorderSamples };
+  const api = { VERTEX, FRAGMENT, Unit, Shader, buildProgram, parseVector, parseScalar, routeBorderSamples };
   G.WEShader = api;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
 })();

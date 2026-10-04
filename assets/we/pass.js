@@ -7,7 +7,6 @@
 
   const TEXTURE_UNITS = 8;
   const IDENTITY4 = M.identity();
-  const IDENTITY3 = new Float32Array([1, 0, 0, 0, 1, 0, 0, 0, 1]);
   const EMPTY_OVERRIDE = { combos: {}, constants: {}, textures: {}, usertextures: {}, textureUsers: {}, shaderOverride: null };
 
   function isFBOName(name) { return name.indexOf('_rt_') === 0 || name.indexOf('_alias_') === 0; }
@@ -46,7 +45,7 @@
       case gl.FLOAT_VEC2: gl.uniform2fv(loc, fill(u.scratch, value, 2)); return;
       case gl.FLOAT_VEC3: gl.uniform3fv(loc, fill(u.scratch, value, 3)); return;
       case gl.FLOAT_VEC4: gl.uniform4fv(loc, fill(u.scratch, value, 4)); return;
-      case gl.INT: case gl.BOOL: case gl.SAMPLER_2D: case gl.UNSIGNED_INT:
+      case gl.INT: case gl.BOOL: case gl.SAMPLER_2D: case gl.SAMPLER_2D_SHADOW: case gl.UNSIGNED_INT:
         if (u.size > 1) gl.uniform1iv(loc, fill(u.iscratch, value, 1)); else gl.uniform1i(loc, Math.trunc(scalar(value)));
         return;
       case gl.INT_VEC2: case gl.BOOL_VEC2: gl.uniform2iv(loc, fill(u.iscratch, value, 2)); return;
@@ -94,7 +93,7 @@
    * renderable may also offer `passUniforms(pass)` returning extra uniform getters by name.
    */
   class Pass {
-    constructor(renderable, fboProvider, materialPass, override, binds, target) {
+    constructor(renderable, fboProvider, materialPass, override, binds, target, previousTarget) {
       this.renderable = renderable;
       this.scene = renderable.scene;
       this.gl = this.scene.gl;
@@ -103,6 +102,7 @@
       this.override = override || EMPTY_OVERRIDE;
       this.binds = binds || {};
       this.target = target || null;
+      this.previousTarget = previousTarget || null;
       this.blendingMode = materialPass.blending;
       this.combos = {};
       this.textures = {};
@@ -110,7 +110,16 @@
       this.uniformList = [];
       this.attribs = [];
       this.slotResolutions = {};
+      this.slotTexels = [];
+      this.slotMipLevels = new Float32Array(TEXTURE_UNITS).fill(1);
+      this.readsMipMappedFrame = false;
+      for (let i = 0; i < TEXTURE_UNITS; i++) this.slotTexels.push(new Float32Array([1, 1, 1, 1]));
       this.borderMask = 0;
+      this.extraUniforms = {};
+      this.viewportRect = null;
+      this.depthOnly = false;
+      this.cullFront = false;
+      this.normalMatrixCache = { source: null, matrix: new Float32Array([1, 0, 0, 0, 1, 0, 0, 0, 1]) };
       this.texture0Resolution = new Float32Array(4);
       this.mvp = IDENTITY4;
       this.mvpInverse = IDENTITY4;
@@ -147,11 +156,7 @@
     async setupShaders() {
       const gl = this.gl;
       const texture0 = this.renderable.texture;
-      Object.assign(this.combos, this.pass.combos);
-      if (texture0) {
-        if (texture0.format === G.WETex.FORMAT.RG88) this.combos.TEX0FORMAT = 8;
-        else if (texture0.format === G.WETex.FORMAT.R8) this.combos.TEX0FORMAT = 9;
-      }
+      Object.assign(this.combos, this.scene.engineCombos(), this.pass.combos);
       const shaderName = this.override.shaderOverride || this.pass.shader;
       const passTextures = Object.assign({}, this.pass.textures, this.pass.usertextures);
       const constants = {};
@@ -164,6 +169,7 @@
         passTextures,
         overrideTextures: this.override.textures,
       });
+      await this.resolveFormatCombos(texture0);
       const built = G.WEShader.buildProgram(gl, this.shader);
       this.program = built.program;
       this.programUniforms = built.uniforms;
@@ -211,6 +217,33 @@
       }
     }
 
+    // TEX<n>FORMAT tells shader code sampling a formatcombo slot which texture format it reads
+    async resolveFormatCombos(texture0) {
+      const slots = Object.assign({}, this.shader.vertex.formatCombos, this.shader.fragment.formatCombos);
+      if (texture0) slots[0] = true;
+      for (const key of Object.keys(slots)) {
+        const index = parseInt(key, 10);
+        const combo = 'TEX' + index + 'FORMAT';
+        if (combo in this.combos) continue;
+        const texture = index === 0 && texture0 ? texture0 : await this.slotTexture(index);
+        // An unbound slot samples opaque black whatever format the shader is told
+        const format = texture ? (texture.current ? texture.current.format : texture.format) : G.WETex.FORMAT.RGBA8888;
+        this.combos[combo] = format;
+      }
+    }
+
+    // The texture a slot ends up sampling, layered the way setupTextureUniforms layers them
+    async slotTexture(index) {
+      const sources = [this.binds, this.override.usertextures, this.override.textures, this.pass.usertextures, this.pass.textures, this.shader.fragment.defaultTextures, this.shader.vertex.defaultTextures];
+      for (const map of sources) {
+        const name = map ? map[index] : undefined;
+        if (name === undefined || name === null) continue;
+        if (name === 'previous') return this.previousTarget ? this.resolveFBO(this.previousTarget) : (this.renderable.mainFBO || null);
+        return this.resolveTextureName(name);
+      }
+      return null;
+    }
+
     // Prepend a chain entry for a slot (later registrations take precedence, CPass::setupTextureUniforms).
     async pushTexture(index, name) {
       const texture = await this.resolveTextureName(name);
@@ -226,6 +259,8 @@
       for (const [index, name] of entries(this.pass.usertextures)) await this.pushTexture(index, name);
       for (const [index, name] of entries(this.override.textures)) await this.pushTexture(index, name);
       for (const [index, name] of entries(this.override.usertextures)) await this.pushTexture(index, name);
+      const mipmapped = this.scene.fbos.find('_rt_MipMappedFrameBuffer');
+      for (const chain of Object.values(this.textures)) for (let c = chain; c; c = c.next) if (c.texture === mipmapped) this.readsMipMappedFrame = true;
       // binds are set last as they're the most important
       for (const [index, bind] of entries(this.binds)) {
         const texture = bind === 'previous' ? null : this.resolveFBO(bind);
@@ -280,8 +315,18 @@
       this.addUniform('g_EffectModelViewProjectionMatrix', () => this.mvp);
       this.addUniform('g_ModelMatrix', () => this.modelMatrix);
       this.addUniform('g_EffectModelMatrix', () => this.modelMatrix);
-      this.addUniform('g_NormalModelMatrix', () => IDENTITY3);
+      this.addUniform('g_NormalModelMatrix', () => this.normalMatrix());
+      this.addUniform('g_AltNormalModelMatrix', () => this.normalMatrix());
       this.addUniform('g_ViewProjectionMatrix', () => this.viewProjectionMatrix);
+      this.addUniform('g_AltModelMatrix', () => this.modelMatrix);
+      this.addUniform('g_AltViewProjectionMatrix', () => this.viewProjectionMatrix);
+      this.addUniform('g_EyePosition', () => scene.camera.eyePosition);
+      for (let i = 0; i < TEXTURE_UNITS; i++) {
+        const slot = i;
+        this.addUniform('g_Texture' + i + 'Texel', () => this.slotTexels[slot]);
+        this.addUniform('g_Texture' + i + 'MipMapInfo', () => this.slotMipLevels[slot]);
+      }
+      if (scene.lights) for (const [name, get] of Object.entries(scene.lights.uniforms())) this.addUniform(name, get);
       this.addUniform('g_PointerPosition', () => scene.mouse.position);
       this.addUniform('g_PointerPositionLast', () => scene.mouse.positionLast);
       this.addUniform('g_EffectTextureProjectionMatrix', () => IDENTITY4);
@@ -298,21 +343,30 @@
       audio = this.addUniform('g_AudioSpectrum64Left', () => scene.audio.left64) || audio;
       audio = this.addUniform('g_AudioSpectrum64Right', () => scene.audio.right64) || audio;
       if (audio) scene.requireAudio();
-      this.addUniform('g_LightsPosition', () => scene.lights.positions);
-      this.addUniform('g_LightsColorPremultiplied', () => scene.lights.colors);
-      this.addUniform('g_LightsRadius', () => scene.lights.radii);
       // Renderables with vertex streams of their own (particles, puppets) supply the uniforms
       // their shaders read beyond the engine set: `passUniforms(pass)` -> {name: getter}.
       if (typeof r.passUniforms === 'function') {
         for (const [name, get] of Object.entries(r.passUniforms(this))) this.addUniform(name, get);
       }
+      for (const [name, get] of Object.entries(this.extraUniforms)) this.addUniform(name, get);
       for (const [name, info] of Object.entries(this.programUniforms)) {
         if (this.uniforms.has(name)) continue;
-        if (info.type === this.gl.SAMPLER_2D) continue;
-        if (/^g_Texture\d+(Rotation|Translation|Resolution)$/.test(name)) continue;
+        if (info.type === this.gl.SAMPLER_2D || info.type === this.gl.SAMPLER_2D_SHADOW) continue;
+        if (/^g_Texture\d+(Rotation|Translation|Resolution|Texel|MipMapInfo)$/.test(name)) continue;
         throw new Error('shader ' + this.pass.shader + ' reads uniform ' + name + ', which neither the engine nor the material provides');
       }
       this.uniformList = Array.from(this.uniforms.values());
+    }
+
+    // The inverse transpose of the model matrix's upper 3x3, which carries normals to world space
+    normalMatrix() {
+      const cache = this.normalMatrixCache;
+      if (cache.source === this.modelMatrix && cache.stamp === this.scene.time) return cache.matrix;
+      const t = M.transpose(M.inverse(this.modelMatrix));
+      cache.matrix.set([t[0], t[1], t[2], t[4], t[5], t[6], t[8], t[9], t[10]]);
+      cache.source = this.modelMatrix;
+      cache.stamp = this.scene.time;
+      return cache.matrix;
     }
 
     // CPass::setupAttributes / addAttribute
@@ -382,9 +436,20 @@
     bindTextureUnit(index, texture, frame) {
       if (!texture) return;
       const gl = this.gl;
+      const scene = this.scene;
+      // Reading the frame buffer while drawing into it is a feedback loop, so such reads see a copy
+      if (texture === scene.fbo && this.drawTo === scene.fbo) {
+        texture = scene.frameCopy();
+        gl.bindFramebuffer(gl.FRAMEBUFFER, this.drawTo.framebuffer);
+      }
       gl.activeTexture(gl.TEXTURE0 + index);
       gl.bindTexture(gl.TEXTURE_2D, texture.textureId(frame));
       this.slotResolutions[index] = texture.resolution;
+      const tw = texture.textureWidth(frame), th = texture.textureHeight(frame);
+      if (index < TEXTURE_UNITS) {
+        this.slotTexels[index].set([1 / tw, 1 / th, tw, th]);
+        this.slotMipLevels[index] = texture.mipLevels || 1;
+      }
       if (texture.flags & G.WETex.FLAG.CLAMP_UVS_BORDER) this.borderMask |= 1 << index;
     }
 
@@ -418,7 +483,21 @@
       const gl = this.gl;
       const Mat = G.WEMaterial;
       gl.bindFramebuffer(gl.FRAMEBUFFER, this.drawTo.framebuffer);
-      gl.viewport(0, 0, this.drawTo.realWidth, this.drawTo.realHeight);
+      const rect = this.viewportRect;
+      if (rect) gl.viewport(rect[0], rect[1], rect[2], rect[3]);
+      else gl.viewport(0, 0, this.drawTo.realWidth, this.drawTo.realHeight);
+      if (this.depthOnly) {
+        // Shadow casters write depth only, every face, nudged back to keep receivers out of their own shadow
+        gl.disable(gl.BLEND);
+        gl.enable(gl.DEPTH_TEST);
+        gl.depthFunc(gl.LEQUAL);
+        gl.depthMask(true);
+        gl.disable(gl.CULL_FACE);
+        gl.enable(gl.POLYGON_OFFSET_FILL);
+        gl.polygonOffset(1.1, 4);
+        return;
+      }
+      gl.cullFace(this.cullFront ? gl.FRONT : gl.BACK);
       switch (this.blendingMode) {
         case Mat.BLENDING.TRANSLUCENT:
           gl.enable(gl.BLEND);
@@ -475,15 +554,27 @@
       }
     }
 
+    // Instanced materials such as fur draw INSTANCECOUNT copies told apart by gl_InstanceID
+    instanceCount() {
+      for (const combos of [this.combos, this.shader.fragment.discoveredCombos, this.shader.vertex.discoveredCombos]) {
+        if (combos.INSTANCECOUNT !== undefined) return Math.max(1, combos.INSTANCECOUNT | 0);
+      }
+      return 1;
+    }
+
     // CPass::renderGeometry
     renderGeometry() {
-      if (this.geometry) { this.geometry.draw(this); return; }
-      this.gl.drawArrays(this.gl.TRIANGLES, 0, 6);
+      const instances = this.instanceCount();
+      if (this.geometry) { this.geometry.draw(this, instances); return; }
+      if (instances > 1) this.gl.drawArraysInstanced(this.gl.TRIANGLES, 0, 6, instances);
+      else this.gl.drawArrays(this.gl.TRIANGLES, 0, 6);
     }
 
     // CPass::cleanupRenderSetup
     cleanupRenderSetup() {
       const gl = this.gl;
+      if (this.depthOnly) gl.disable(gl.POLYGON_OFFSET_FILL);
+      if (this.cullFront) gl.cullFace(gl.BACK);
       if (this.geometry) this.geometry.cleanup(this);
       else for (const a of this.attribs) gl.disableVertexAttribArray(a.location);
       gl.activeTexture(gl.TEXTURE0);
@@ -498,6 +589,7 @@
     render() {
       if (!this.drawTo) throw new Error('render pass ' + this.pass.shader + ' of object ' + this.renderable.id + ' has no destination FBO');
       if (!this.input) throw new Error('render pass ' + this.pass.shader + ' of object ' + this.renderable.id + ' has no input texture');
+      if (this.readsMipMappedFrame) this.scene.refreshMipMappedFrameBuffer();
       this.gl.bindVertexArray(this.vao);
       this.setupRenderFramebuffer();
       this.setupRenderTexture();

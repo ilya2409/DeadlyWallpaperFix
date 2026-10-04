@@ -427,12 +427,13 @@
     let data;
     try { data = JSON.parse(text); } catch (e) { throw new Error(name + ': bone "' + bone.name + '" carries simulation settings that are not JSON: ' + text); }
     if (!data || typeof data !== 'object') return null;
-    const known = { gravity: 'gravity', stiffness: 'stiffness', damping: 'damping', mass: 'mass', drag: 'drag', windstrength: 'wind', windmultiplier: 'wind', windmultiplier2: 'wind', windangle: 'windAngle', angle: 'angle', anglemin: 'angleMin', anglemax: 'angleMax', limit: 'limit', limits: 'limit', enabled: 'enabled', type: 'type', priority: 'priority', bounce: 'bounce', friction: 'friction', origin: 'origin', length: 'length', radius: 'radius', constraint: 'constraint', constraints: 'constraint', simulationmode: 'mode', mode: 'mode', flags: 'flags', name: 'name', mass2: 'mass' };
+    const known = { gravity: 'gravity', stiffness: 'stiffness', damping: 'damping', mass: 'mass', drag: 'drag', windstrength: 'wind', windmultiplier: 'wind', windmultiplier2: 'wind', windangle: 'windAngle', angle: 'angle', anglemin: 'angleMin', anglemax: 'angleMax', limit: 'limit', limits: 'limit', enabled: 'enabled', type: 'type', priority: 'priority', bounce: 'bounce', friction: 'friction', origin: 'origin', length: 'length', radius: 'radius', constraint: 'constraint', constraints: 'constraint', simulationmode: 'mode', mode: 'mode', flags: 'flags', name: 'name', mass2: 'mass', a: 'angle', s: 'stiffness', lamin: 'angleMin', lamax: 'angleMax', tp: 'tip', tm: 'tipMass', rax: 'axisX', ray: 'axisY', raz: 'axisZ' };
     const sim = { enabled: true, gravity: 0, stiffness: 10, damping: 2, mass: 1, angleMin: -Math.PI, angleMax: Math.PI, raw: data };
     const unknown = [];
     for (const [k, v] of Object.entries(data)) {
       const key = known[k.toLowerCase()];
       if (!key) { unknown.push(k); continue; }
+      if (v === null) continue;
       if (key === 'enabled') sim.enabled = !!v;
       else if (typeof v === 'number') sim[key] = v;
       else if (typeof v === 'boolean') sim[key] = v ? 1 : 0;

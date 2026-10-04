@@ -390,7 +390,7 @@
     const data = scene.data;
     const h = {};
     const layers = () => scene.renderOrder.filter((o) => o.id !== G.WEScene.BLOOM_ID);
-    h.getLayer = (ref) => layerHandle(ctx, ctx.resolveLayer(ref));
+    h.getLayer = (ref) => { const object = ctx.findLayer(ref); return object ? layerHandle(ctx, object) : null; };
     h.getLayerByID = (id) => {
       const n = typeof id === 'number' ? id : parseInt(String(id), 10);
       if (!Number.isFinite(n)) throw new Error('getLayerByID needs a numeric id, not ' + JSON.stringify(id));
@@ -419,7 +419,8 @@
       if (t.up !== undefined) scene.camera.up = arr3(t.up);
       if (t.zoom !== undefined) { const z = Number(t.zoom); if (!(z > 0)) throw new Error('camera zoom must be positive, not ' + t.zoom); ctx.cameraZoom = z; }
       scene.camera.lookAt = M.lookAt(scene.camera.eye, scene.camera.center, scene.camera.up);
-      scene.camera.setOrthogonalProjection(scene.width / ctx.cameraZoom, scene.height / ctx.cameraZoom);
+      if (scene.is3D) scene.camera.setPerspectiveProjection(scene.width, scene.height);
+      else scene.camera.setOrthogonalProjection(scene.width / ctx.cameraZoom, scene.height / ctx.cameraZoom);
     };
     h.getAnimation = (name) => ctx.findAnimation(name, null);
     h.createModelData = () => { throw new Error('createModelData: procedural model layers need Wallpaper Engine\'s model-data material, which this renderer does not have'); };

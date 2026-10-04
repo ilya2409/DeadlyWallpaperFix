@@ -137,7 +137,7 @@
       def.controlPoints.push({ id: opt(cp, 'id', -1), flags, offset: vec3('offset', cp, [0, 0, 0]), lockToPointer: !!opt(cp, 'locktopointer', false) });
     }
     for (const ch of json.children || []) {
-      def.children.push({ type: typeof ch.type === 'string' ? ch.type : 'static', name: typeof ch.name === 'string' ? ch.name : '', maxCount: opt(ch, 'maxcount', null), controlPointStartIndex: opt(ch, 'controlpointstartindex', 0), probability: opt(ch, 'probability', 1), angles: vec3('angles', ch, [0, 0, 0]), origin: vec3('origin', ch, [0, 0, 0]), scale: vec3('scale', ch, [1, 1, 1]), particle: typeof ch.particle === 'string' ? ch.particle : '' });
+      def.children.push({ type: typeof ch.type === 'string' ? ch.type : 'static', name: typeof ch.name === 'string' ? ch.name : '', maxCount: opt(ch, 'maxcount', null), controlPointStartIndex: opt(ch, 'controlpointstartindex', 0), probability: opt(ch, 'probability', 1), angles: vec3('angles', ch, [0, 0, 0]), origin: vec3('origin', ch, [0, 0, 0]), scale: vec3('scale', ch, [1, 1, 1]), particle: typeof ch.particle === 'string' ? ch.particle : (typeof ch.name === 'string' && /\.json$/i.test(ch.name) ? ch.name : '') });
     }
     const io = object && object.instanceoverride && typeof object.instanceoverride === 'object' ? object.instanceoverride : {};
     const iu = (field, dflt, expectColor) => s(io[field] === undefined ? dflt : io[field], { where: 'instanceoverride.' + field, expectColor, default: dflt });
@@ -158,6 +158,7 @@
       this.angles = opts.angles;
       this.sceneWidth = opts.sceneWidth;
       this.sceneHeight = opts.sceneHeight;
+      this.is3D = !!opts.is3D;
       this.audio = opts.audio;
       this.renderer = def.renderers[0];
       this.rope = this.renderer.name === 'rope' || this.renderer.name === 'ropetrail';
@@ -181,13 +182,28 @@
       this.turbulence = def.operators.filter((o) => o.name === 'turbulence').map((o) => ({ phase: rand(num(o.phaseMin, 0), num(o.phaseMax, 0)), speed: rand(num(o.speedMin, 500), num(o.speedMax, 1000)) }));
       this.sequence = 0;
       for (const it of def.initializers) if (it.name === 'lifetimerandom') this.uniformLifetimes = num(it.min, 0) === num(it.max, 1);
+      this.worldOrigin = null;
       this.refreshOrigin();
+      this.forcedEmit = 0;
+      // The particles the last update spawned, for children that start at a birth
+      this.born = [];
+    }
+
+    // Back to the state a freshly created system starts in, with no particles alive
+    reset() {
+      for (const p of this.particles) p.alive = false;
+      this.born = [];
+      this.count = 0;
+      this.time = 0;
+      this.started = false;
+      this.emitterStates = this.def.emitters.map((e) => ({ timer: 0, delay: e.delay, duration: 0, periodicTimer: 0, periodicDuration: 0, periodicDelay: 0, emitting: false, instantaneousDone: false }));
+      this.sequence = 0;
       this.forcedEmit = 0;
     }
 
     refreshOrigin() {
       const o = vec(this.origin, 3, [0, 0, 0]);
-      this.transformedOrigin = [o[0] - this.sceneWidth / 2, this.sceneHeight / 2 - o[1], o[2]];
+      this.transformedOrigin = this.worldOrigin ? this.worldOrigin.slice() : (this.is3D ? [o[0], o[1], o[2]] : [o[0] - this.sceneWidth / 2, this.sceneHeight / 2 - o[1], o[2]]);
       for (const cp of this.def.controlPoints) {
         if (cp.id < 0 || cp.id >= 8) continue;
         const c = this.controlPoints[cp.id];
@@ -236,6 +252,7 @@
       p.frame = -1;
       p.initial.color = p.color.slice(); p.initial.alpha = p.alpha; p.initial.size = p.size; p.initial.lifetime = p.lifetime;
       p.oscAlpha = null; p.oscSize = null; p.oscPos = null;
+      this.born.push(p);
       if (emitter && (emitter.speedMax > 0 || emitter.speedMin !== 0)) {
         const len = Math.hypot(randomPos[0], randomPos[1], randomPos[2]);
         const dir = len > 0 ? [randomPos[0] / len, randomPos[1] / len, randomPos[2] / len] : [0, 1, 0];
@@ -582,6 +599,7 @@
           cp.position = [pos[0] - this.transformedOrigin[0], pos[1] - this.transformedOrigin[1], pos[2] - this.transformedOrigin[2]];
         }
       }
+      this.born = [];
       this.emit(dt);
       for (let i = 0; i < this.count; i++) this.particles[i].age += dt;
       for (const op of this.def.operators) this.operate(op, dt);
@@ -719,7 +737,10 @@
       const camera = scene.camera;
       const model = this.modelMatrix(parallaxOffset);
       let viewProjection, eye;
-      if (this.def.flags & 4) {
+      if (camera.perspective) {
+        viewProjection = camera.viewProjection;
+        eye = camera.eyePosition;
+      } else if (this.def.flags & 4) {
         const aspect = camera.width / camera.height;
         const fov = camera.fov.getNumber() * Math.PI / 180;
         viewProjection = M.multiply(M.perspective(fov, aspect, camera.nearz.getNumber(), camera.farz.getNumber()), M.lookAt([0, 0, 1000], [0, 0, 0], [0, 1, 0]));

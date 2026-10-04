@@ -104,6 +104,15 @@
       return o;
     }
 
+    // The layer a name or index refers to, or null when nothing has it, as getLayer answers scripts
+    findLayer(ref) {
+      if (ref && typeof ref === 'object') return L.objectOf(ref) || null;
+      const layers = this.layers();
+      if (typeof ref === 'number') return Number.isInteger(ref) && ref >= 0 && ref < layers.length ? layers[ref] : null;
+      if (typeof ref === 'string') return layers.find((o) => o.name === ref) || Array.from(this.scene.objects.values()).find((o) => o.name === ref) || null;
+      return null;
+    }
+
     // A layer by handle, index in the layer list, or name.
     resolveLayer(ref) {
       if (ref && typeof ref === 'object') {

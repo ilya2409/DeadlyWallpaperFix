@@ -255,6 +255,12 @@ impl Project {
     /// values can be sent back in Wallpaper Engine's encoding.
     pub fn controls(&self) -> Properties {
         let mut out = Map::new();
+        if self.kind == ProjectType::Scene {
+            out.insert(
+                crate::model::props::FIT_CONTROL.into(),
+                crate::model::props::scene_fit_control(),
+            );
+        }
         for p in &self.properties {
             let mut c = match &p.kind {
                 PropertyKind::Slider {
@@ -644,7 +650,21 @@ mod tests {
         let p = Project::parse(SAMPLE).unwrap();
         let controls = p.controls();
         let names: Vec<String> = controls.controls().into_iter().map(|(n, _)| n).collect();
-        assert_eq!(names[0], "schemecolor");
+        assert_eq!(
+            names[0],
+            crate::model::props::FIT_CONTROL,
+            "scenes start with their fit"
+        );
+        assert_eq!(names[1], "schemecolor");
+        let fit = controls.get(crate::model::props::FIT_CONTROL).unwrap();
+        assert!(
+            fit.we.is_none(),
+            "the fit is the host's, not a project property"
+        );
+        assert!(matches!(
+            fit.kind,
+            ControlKind::ScalerDropdown { value: 3, ref items } if items.len() == 4
+        ));
         let color = controls.get("schemecolor").unwrap();
         assert_eq!(
             color.kind,
